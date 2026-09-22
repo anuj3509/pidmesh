@@ -97,7 +97,17 @@ otherwise a stale footprint from a co-located session would argue with its own c
 changed in more than one checkout is classified by merge outcome rather than by lock
 ownership. `identical` means every participant reached the same outcome: the same content hash, or every
 checkout deleting the path. `delete_edit` means at least one participant removed the path while
-another still edits it, and outranks content comparison. Everything else is `divergent`. Collisions separately report whether the participants
+another still edits it, and outranks content comparison.
+
+Differing content in one path is not automatically a conflict. A scan also records which regions
+of the *base* file each checkout rewrote, in base-file line numbers rather than working-tree ones,
+because a three-way merge conflicts when two sides rewrote overlapping regions of the common
+ancestor. When every pair of participants rewrote disjoint regions the collision is `adjacent`:
+real contention on a shared file that git will nonetheless merge cleanly. Everything else is
+`divergent`. Regions are taken from a single diff of the base commit against the working tree,
+which already unions committed and uncommitted work. A pure insertion is recorded as the single
+base line it sits against, so two insertions at the same point still register as overlapping, and
+a path whose regions are unknown is assumed to overlap — a downgrade must be provable. Collisions separately report whether the participants
 cut their checkouts from different base commits, because a stale base is how a textually clean merge
 still produces incorrect behaviour.
 
@@ -133,7 +143,8 @@ live checkout holds different content on a path this one changed. A held integra
 another agent is merging at this moment.
 
 Two things deliberately do not block. Byte-identical content is duplicated effort, so merging
-either copy is safe. A peer that is no longer running does not block either: its preserved worktree
+either copy is safe, and so is an `adjacent` collision, which is precisely the case three-way
+merging exists to resolve. A peer that is no longer running does not block either: its preserved worktree
 is still reported as a collision, but it cannot be asked to rebase, and treating it as a blocker
 would deadlock every later merge behind an agent that has already exited.
 

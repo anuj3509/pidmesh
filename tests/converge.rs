@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -1150,5 +1151,80 @@ fn the_integration_lease_admits_one_merge_at_a_time() -> Result<()> {
         .store
         .release(&bravo, pidmesh::store::INTEGRATION_TASK_KEY)?;
     assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
+    Ok(())
+}
+
+/// The case that decides whether this signal is usable at fleet scale.
+///
+/// A shared router or module index is edited by every agent. Flagging it `divergent` every time
+/// trains an operator to ignore collisions. Git merges edits to separable regions of one file
+/// cleanly, so the mesh must say so.
+#[test]
+fn separate_regions_of_a_shared_file_do_not_conflict() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let routes = (1..=60).fold(String::new(), |mut routes, line| {
+        let _ = writeln!(routes, "route_{line}();");
+        routes
+    });
+    std::fs::write(fleet.repository.join("src/routes.rs"), &routes)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "routes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Each agent registers its own route, far apart in the same file.
+    let top: String = routes.replace("route_3();", "route_3_owned_by_alpha();");
+    let bottom: String = routes.replace("route_55();", "route_55_owned_by_bravo();");
+    std::fs::write(alpha_tree.join("src/routes.rs"), &top)?;
+    std::fs::write(bravo_tree.join("src/routes.rs"), &bottom)?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&alpha)?;
+    let routes_collision = at(&collisions, "src/routes.rs").context("expected a collision")?;
+    assert_eq!(
+        routes_collision["severity"], "adjacent",
+        "separable edits must not read as overwriting: {routes_collision}"
+    );
+
+    // And an adjacent collision must not block the merge either.
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], true, "{report}");
+    Ok(())
+}
+
+#[test]
+fn edits_to_the_same_region_of_a_shared_file_still_conflict() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let routes = (1..=60).fold(String::new(), |mut routes, line| {
+        let _ = writeln!(routes, "route_{line}();");
+        routes
+    });
+    std::fs::write(fleet.repository.join("src/routes.rs"), &routes)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "routes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Both rewrite the same line.
+    std::fs::write(
+        alpha_tree.join("src/routes.rs"),
+        routes.replace("route_30();", "route_30_alpha();"),
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/routes.rs"),
+        routes.replace("route_30();", "route_30_bravo();"),
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&alpha)?;
+    let routes_collision = at(&collisions, "src/routes.rs").context("expected a collision")?;
+    assert_eq!(routes_collision["severity"], "divergent");
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
     Ok(())
 }

@@ -148,7 +148,8 @@ Each contested path is classified by what would actually happen on merge:
 | Severity | Meaning |
 | --- | --- |
 | `identical` | Every checkout reached the same outcome — byte-identical content, or all of them deleting the path: duplicated effort, safe to merge. |
-| `divergent` | The same path holds different content in different checkouts. This is the case that silently overwrites work. |
+| `adjacent` | The same path, but each checkout rewrote separable regions of it. Git three-way merges these cleanly, so they do not block. |
+| `divergent` | The same path, with edits to overlapping regions. This is the case that silently overwrites work. |
 | `delete_edit` | One agent removed a path another is still editing. Git merges this without complaint in several common orderings. |
 
 Every collision also reports `base_divergent`. Two agents can edit different files and still break
@@ -170,10 +171,12 @@ pidmesh integrate --release
 | Blocker | Meaning |
 | --- | --- |
 | `stale_base` | The integration branch advanced since this worktree was cut. The diff may still apply cleanly and be wrong, because it was written against code that no longer exists. Rebase. |
-| `contested_path` | Another **live** checkout holds different content on a path this one changed. |
+| `contested_path` | Another **live** checkout rewrote an overlapping region of a path this one changed. |
 | `integration_held` | Another agent holds the integration lease and is merging right now. |
 
 Duplicated work never blocks: if two checkouts hold byte-identical content, merging either is safe.
+Neither do `adjacent` edits, which is what keeps a shared router or module index from blocking the
+whole fleet.
 Neither does a stopped peer — its preserved worktree is still reported as a collision, but it
 cannot be asked to rebase and must not deadlock the queue behind it.
 
@@ -286,6 +289,7 @@ the server from the project directory. `PIDMESH_DB` overrides the default
 - Observed footprints detect overlapping edits that no agent reserved.
 - Collision events fire on transitions only, so steady-state re-scanning is free.
 - A watcher can observe every checkout without any agent participating.
+- Edits to separable regions of one file are distinguished from edits that overwrite each other.
 - A stale base blocks a merge even when the diff would apply cleanly.
 - The integration lease admits one merge at a time and has exactly one owner until expiry.
 

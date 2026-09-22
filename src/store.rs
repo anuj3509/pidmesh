@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS footprints (
     digest TEXT,
     base_commit TEXT,
     branch TEXT,
+    ranges TEXT,
     observed_at INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, agent_id, path)
 );
@@ -865,7 +866,9 @@ impl MeshStore {
                     continue;
                 }
                 let severity = classify(&participants);
-                if severity == "identical" {
+                // Duplicated work is safe to merge, and edits to separable regions of one file
+                // are what git three-way merges exist to resolve.
+                if severity == "identical" || severity == "adjacent" {
                     continue;
                 }
                 let peers: Vec<Value> = participants
@@ -979,8 +982,8 @@ impl MeshStore {
                 transaction.execute(
                     "INSERT INTO footprints(
                         workspace_id, agent_id, path, change_kind, digest,
-                        base_commit, branch, observed_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        base_commit, branch, ranges, observed_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         agent.workspace_id,
                         agent_id,
@@ -989,6 +992,7 @@ impl MeshStore {
                         entry.digest,
                         scan.base_commit,
                         scan.branch,
+                        entry.ranges,
                         now
                     ],
                 )?;
@@ -1390,7 +1394,8 @@ impl MeshStore {
                 Ok(()) => {
                     add_column_if_missing(&connection, "agents", "checkout_path", "TEXT")?;
                     add_column_if_missing(&connection, "agents", "git_branch", "TEXT")?;
-                    connection.pragma_update(None, "user_version", 3)?;
+                    add_column_if_missing(&connection, "footprints", "ranges", "TEXT")?;
+                    connection.pragma_update(None, "user_version", 4)?;
                     return Ok(());
                 }
                 Err(error) if is_busy(&error) && attempt < 7 => {
@@ -1916,7 +1921,7 @@ fn workspace_collisions(
         "WITH ranked AS (
              SELECT f.path AS path, f.agent_id AS agent_id, a.name AS agent_name,
                     a.status AS status, f.change_kind AS change_kind, f.digest AS digest,
-                    f.base_commit AS base_commit, f.branch AS branch,
+                    f.base_commit AS base_commit, f.branch AS branch, f.ranges AS ranges,
                     ROW_NUMBER() OVER (
                         PARTITION BY f.path, COALESCE(a.checkout_path, f.agent_id)
                         ORDER BY f.observed_at DESC, f.agent_id
@@ -1925,7 +1930,8 @@ fn workspace_collisions(
              JOIN agents a ON a.id = f.agent_id
              WHERE f.workspace_id = ?1
          )
-         SELECT path, agent_id, agent_name, status, change_kind, digest, base_commit, branch
+         SELECT path, agent_id, agent_name, status, change_kind, digest, base_commit, branch,
+                ranges
          FROM ranked
          WHERE position = 1
            AND path IN (
@@ -1945,6 +1951,7 @@ fn workspace_collisions(
                 digest: row.get(5)?,
                 base_commit: row.get(6)?,
                 branch: row.get(7)?,
+                ranges: row.get(8)?,
             },
         ))
     })?;
@@ -2007,7 +2014,8 @@ fn collision_report(contested: &[(String, Vec<Participant>)], viewer: &str) -> V
                         "change_kind": participant.change_kind,
                         "digest": participant.digest,
                         "base_commit": participant.base_commit,
-                        "branch": participant.branch
+                        "branch": participant.branch,
+                        "ranges": participant.ranges
                     }))
                     .collect::<Vec<Value>>()
             })

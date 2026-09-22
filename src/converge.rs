@@ -68,6 +68,12 @@ pub struct FootprintEntry {
     pub change_kind: ChangeKind,
     /// Blob hash of the new content, or `None` for deletions and unhashable paths.
     pub digest: Option<String>,
+    /// Regions of the *base* file this checkout rewrote, as `start-end` pairs joined by commas.
+    ///
+    /// Base coordinates, not working-tree coordinates, because a three-way merge conflicts when
+    /// two sides rewrote overlapping regions of the common ancestor. `None` means the regions
+    /// are unknown and the paths must be assumed to overlap.
+    pub ranges: Option<String>,
 }
 
 /// A complete observation of one checkout at a point in time.
@@ -89,6 +95,7 @@ pub struct Participant {
     pub digest: Option<String>,
     pub base_commit: Option<String>,
     pub branch: Option<String>,
+    pub ranges: Option<String>,
 }
 
 /// Collision severity for a single contested path.
@@ -123,7 +130,51 @@ pub fn classify(participants: &[Participant]) -> &'static str {
     {
         return "identical";
     }
+    // Different content in the same file is not automatically a conflict. A shared router or
+    // module index is edited by everyone, and git merges those edits cleanly as long as they
+    // rewrote different regions of the common ancestor.
+    if disjoint_regions(participants) {
+        return "adjacent";
+    }
     "divergent"
+}
+
+/// Whether every pair of participants rewrote non-overlapping regions of the base file.
+///
+/// Unknown regions are treated as overlapping, so this only ever downgrades a collision when it
+/// can prove the edits are separable.
+#[must_use]
+fn disjoint_regions(participants: &[Participant]) -> bool {
+    let mut parsed = Vec::new();
+    for participant in participants {
+        let Some(ranges) = participant.ranges.as_deref() else {
+            return false;
+        };
+        parsed.push(parse_ranges(ranges));
+    }
+    for (index, left) in parsed.iter().enumerate() {
+        for right in parsed.iter().skip(index + 1) {
+            if left.iter().any(|outer| {
+                right
+                    .iter()
+                    .any(|inner| outer.0 <= inner.1 && inner.0 <= outer.1)
+            }) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Parse a stored `start-end,start-end` range list.
+fn parse_ranges(ranges: &str) -> Vec<(u32, u32)> {
+    ranges
+        .split(',')
+        .filter_map(|span| {
+            let (start, end) = span.split_once('-')?;
+            Some((start.parse().ok()?, end.parse().ok()?))
+        })
+        .collect()
 }
 
 /// Whether the contesting agents cut their worktrees from different base commits.
@@ -165,6 +216,8 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         kinds.insert(path, kind);
     }
 
+    let mut regions = changed_regions(checkout, &base_commit).unwrap_or_default();
+
     let entries = kinds
         .into_iter()
         .map(|(path, reported)| {
@@ -186,10 +239,12 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
             } else {
                 digest_of(&absolute)
             };
+            let ranges = regions.remove(&path);
             FootprintEntry {
                 path,
                 change_kind,
                 digest,
+                ranges,
             }
         })
         .collect();
@@ -288,6 +343,57 @@ fn uncommitted_changes(checkout: &Path) -> Result<Vec<(String, ChangeKind)>> {
         .collect())
 }
 
+/// Regions of the base file each tracked path rewrote, in base-file line numbers.
+///
+/// One `git diff` covers every tracked path, committed and uncommitted alike, because diffing a
+/// commit against the working tree already unions both. Untracked files have no base side and so
+/// appear here at all.
+fn changed_regions(checkout: &Path, base_commit: &str) -> Result<BTreeMap<String, String>> {
+    let raw = git_bytes(
+        checkout,
+        &[
+            "diff",
+            "--unified=0",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            base_commit,
+        ],
+    )?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut regions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            // `--- a/path`, or `--- /dev/null` for an addition, which has no base side.
+            current = rest.strip_prefix("a/").map(ToOwned::to_owned);
+        } else if let Some(rest) = line.strip_prefix("@@ ")
+            && let Some(path) = current.as_ref()
+            && let Some(span) = base_span(rest)
+        {
+            regions.entry(path.clone()).or_default().push(span);
+        }
+    }
+    Ok(regions
+        .into_iter()
+        .map(|(path, spans)| (path, spans.join(",")))
+        .collect())
+}
+
+/// Turn the `-start,count` half of a hunk header into an inclusive `start-end` span.
+fn base_span(header: &str) -> Option<String> {
+    let old = header.split_whitespace().next()?.strip_prefix('-')?;
+    let (start, count) = old
+        .split_once(',')
+        .map_or((old, "1"), |(start, count)| (start, count));
+    let start: u32 = start.parse().ok()?;
+    let count: u32 = count.parse().ok()?;
+    // A pure insertion has count 0 and sits between two base lines; treat it as the single
+    // boundary line so two insertions at the same point still register as overlapping.
+    let end = start.saturating_add(count.saturating_sub(1)).max(start);
+    Some(format!("{start}-{end}"))
+}
+
 /// Fingerprint a path's current bytes.
 ///
 /// This is a mesh-internal digest, not a git object id: it only ever has to answer whether two
@@ -346,6 +452,15 @@ mod tests {
     use super::*;
 
     fn participant(change_kind: &str, digest: Option<&str>, base: Option<&str>) -> Participant {
+        ranged(change_kind, digest, base, None)
+    }
+
+    fn ranged(
+        change_kind: &str,
+        digest: Option<&str>,
+        base: Option<&str>,
+        ranges: Option<&str>,
+    ) -> Participant {
         Participant {
             agent_id: "agent".to_owned(),
             agent_name: "agent".to_owned(),
@@ -354,6 +469,7 @@ mod tests {
             digest: digest.map(ToOwned::to_owned),
             base_commit: base.map(ToOwned::to_owned),
             branch: None,
+            ranges: ranges.map(ToOwned::to_owned),
         }
     }
 
@@ -405,6 +521,55 @@ mod tests {
         ];
         assert!(!base_divergent(&same));
         assert!(base_divergent(&drifted));
+    }
+
+    #[test]
+    fn separable_regions_of_one_file_are_adjacent_not_divergent() {
+        let participants = vec![
+            ranged("modified", Some("aaa"), None, Some("10-12")),
+            ranged("modified", Some("bbb"), None, Some("80-84")),
+        ];
+        assert_eq!(classify(&participants), "adjacent");
+    }
+
+    #[test]
+    fn overlapping_regions_remain_divergent() {
+        let participants = vec![
+            ranged("modified", Some("aaa"), None, Some("10-20")),
+            ranged("modified", Some("bbb"), None, Some("18-24")),
+        ];
+        assert_eq!(classify(&participants), "divergent");
+    }
+
+    #[test]
+    fn touching_regions_count_as_overlapping() {
+        let participants = vec![
+            ranged("modified", Some("aaa"), None, Some("10-20")),
+            ranged("modified", Some("bbb"), None, Some("20-30")),
+        ];
+        assert_eq!(classify(&participants), "divergent");
+    }
+
+    #[test]
+    fn an_unknown_region_is_assumed_to_overlap() {
+        let participants = vec![
+            ranged("modified", Some("aaa"), None, Some("10-12")),
+            ranged("modified", Some("bbb"), None, None),
+        ];
+        assert_eq!(
+            classify(&participants),
+            "divergent",
+            "a downgrade must be provable"
+        );
+    }
+
+    #[test]
+    fn multiple_disjoint_hunks_stay_adjacent() {
+        let participants = vec![
+            ranged("modified", Some("aaa"), None, Some("1-5,40-42")),
+            ranged("modified", Some("bbb"), None, Some("10-12,80-90")),
+        ];
+        assert_eq!(classify(&participants), "adjacent");
     }
 
     #[test]
