@@ -362,79 +362,120 @@ fn two_sessions_sharing_a_checkout_are_one_editor_not_a_collision() -> Result<()
     Ok(())
 }
 
+/// A repository driven through the CLI, with one linked worktree and joined agent per worker.
+///
+/// Agents join from inside their checkout so linked-worktree discovery unifies the mesh, which is
+/// what a real fleet does and what an explicit `--workspace` would bypass.
+struct CliFleet {
+    repository: PathBuf,
+    database: PathBuf,
+    workers: Vec<(String, PathBuf)>,
+}
+
+impl CliFleet {
+    fn new(root: &Path, workers: usize, pid: Option<u32>) -> Result<Self> {
+        let repository = root.join("repository");
+        let database = root.join("fleet.db");
+        std::fs::create_dir(&repository)?;
+        git(&repository, &["init", "-b", "main"])?;
+        git(
+            &repository,
+            &["config", "user.email", "pidmesh@example.com"],
+        )?;
+        git(&repository, &["config", "user.name", "PidMesh Test"])?;
+        std::fs::create_dir(repository.join("src"))?;
+        std::fs::write(repository.join("src/shared.rs"), "fn shared() {}\n")?;
+        git(&repository, &["add", "-A"])?;
+        git(&repository, &["commit", "-m", "initial"])?;
+
+        let mut joined = Vec::new();
+        for worker in 0..workers {
+            let worktree = root.join(format!("wt-{worker}"));
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &format!("feat/{worker}"),
+                    worktree.to_str().context("worktree path")?,
+                ],
+            )?;
+            // Every worktree edits the same path differently, plus one path of its own.
+            std::fs::write(
+                worktree.join("src/shared.rs"),
+                format!("fn shared() {{ /* {worker} */ }}\n"),
+            )?;
+            std::fs::write(worktree.join(format!("src/only-{worker}.rs")), "private\n")?;
+            let mut arguments = vec![
+                "--db".to_owned(),
+                database.to_string_lossy().into_owned(),
+                "join".to_owned(),
+                "--name".to_owned(),
+                format!("worker-{worker}"),
+            ];
+            if let Some(pid) = pid {
+                arguments.push("--pid".to_owned());
+                arguments.push(pid.to_string());
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+                .current_dir(&worktree)
+                .env_remove("PIDMESH_WORKSPACE")
+                .args(&arguments)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let registration: Value = serde_json::from_slice(&output.stdout)?;
+            joined.push((
+                registration["agent_id"]
+                    .as_str()
+                    .context("agent id")?
+                    .to_owned(),
+                worktree,
+            ));
+        }
+        Ok(Self {
+            repository,
+            database,
+            workers: joined,
+        })
+    }
+
+    /// Run a pidmesh subcommand from a directory and parse its JSON.
+    fn run(&self, directory: &Path, arguments: &[&str]) -> Result<Value> {
+        let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+            .current_dir(directory)
+            .env_remove("PIDMESH_WORKSPACE")
+            .args(["--db", self.database.to_str().context("database path")?])
+            .args(arguments)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "pidmesh {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
 /// Contributing guide: transaction changes need multiprocess coverage.
 ///
 /// Eight independent processes scan eight worktrees and publish footprints concurrently against one
-/// SQLite database. Every write must land, and the contested path must end up with exactly eight
+/// `SQLite` database. Every write must land, and the contested path must end up with exactly eight
 /// participants rather than a torn or partially-overwritten set.
 #[test]
 fn eight_processes_publish_footprints_concurrently() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let repository = directory.path().join("repository");
-    let database = directory.path().join("footprints.db");
-    let binary = env!("CARGO_BIN_EXE_pidmesh");
-    std::fs::create_dir(&repository)?;
-    git(&repository, &["init", "-b", "main"])?;
-    git(
-        &repository,
-        &["config", "user.email", "pidmesh@example.com"],
-    )?;
-    git(&repository, &["config", "user.name", "PidMesh Test"])?;
-    std::fs::create_dir(repository.join("src"))?;
-    std::fs::write(repository.join("src/shared.rs"), "fn shared() {}\n")?;
-    git(&repository, &["add", "-A"])?;
-    git(&repository, &["commit", "-m", "initial"])?;
-
-    let mut workers = Vec::new();
-    for worker in 0..8 {
-        let worktree = directory.path().join(format!("wt-{worker}"));
-        git(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &format!("feat/{worker}"),
-                worktree.to_str().context("worktree path")?,
-            ],
-        )?;
-        // Every worktree edits the same path differently, plus one path of its own.
-        std::fs::write(
-            worktree.join("src/shared.rs"),
-            format!("fn shared() {{ /* {worker} */ }}\n"),
-        )?;
-        std::fs::write(worktree.join(format!("src/only-{worker}.rs")), "private\n")?;
-        // Join from inside the checkout so linked-worktree discovery unifies the mesh.
-        let output = Command::new(binary)
-            .current_dir(&worktree)
-            .env_remove("PIDMESH_WORKSPACE")
-            .args([
-                "--db",
-                database.to_str().context("database path")?,
-                "join",
-                "--name",
-                &format!("worker-{worker}"),
-            ])
-            .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let registration: Value = serde_json::from_slice(&output.stdout)?;
-        workers.push((
-            registration["agent_id"]
-                .as_str()
-                .context("agent id")?
-                .to_owned(),
-            worktree,
-        ));
-    }
+    let fleet = CliFleet::new(directory.path(), 8, None)?;
+    let (database, workers) = (&fleet.database, &fleet.workers);
 
     let mut children = Vec::new();
-    for (agent_id, worktree) in &workers {
+    for (agent_id, worktree) in workers {
         children.push(
-            Command::new(binary)
+            Command::new(env!("CARGO_BIN_EXE_pidmesh"))
                 .current_dir(worktree)
                 .env_remove("PIDMESH_WORKSPACE")
                 .args([
@@ -460,23 +501,10 @@ fn eight_processes_publish_footprints_concurrently() -> Result<()> {
         );
     }
 
-    let output = Command::new(binary)
-        .current_dir(&workers[0].1)
-        .env_remove("PIDMESH_WORKSPACE")
-        .args([
-            "--db",
-            database.to_str().context("database path")?,
-            "collisions",
-            "--agent",
-            &workers[0].0,
-        ])
-        .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let report = fleet.run(
+        &fleet.repository,
+        &["collisions", "--agent", workers[0].0.as_str()],
+    )?;
     let collisions = report["collisions"].as_array().context("collisions")?;
     assert_eq!(
         collisions.len(),
