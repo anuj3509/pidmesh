@@ -63,13 +63,14 @@ The IDE release adds:
 - server-side allowlisted Codex and Claude Code launch profiles;
 - real pseudo-terminals with bounded reconnectable scrollback and one-use WebSocket attach tickets;
 - a task-oriented workspace with run navigation, attention states, Files, Diff, Terminal, and Inspector panes;
+- explicit user-named workstreams that group local runs in the workspace sidebar;
 - canonicalized read-only file browsing contained inside the selected checkout;
 - review-time detection of changes outside the reserved path scope;
 - commit and no-fast-forward merge approval gated on process state, scope validity, primary-checkout cleanliness, and the expected base branch;
 - preservation of dirty or failed worktrees instead of automatic destructive cleanup;
 - an Operations view for the original fleet, ownership, memory, message, and event surfaces.
 
-The dashboard accepts task, prompt, provider ID, and relative scopes. It never accepts arbitrary commands, executable paths, environment variables, worktree locations, branch names, or base refs. Terminal output is bounded to 1 MiB per run, input frames are bounded, and the dashboard allows at most eight simultaneous managed sessions.
+The dashboard accepts an explicit workstream, task, prompt, provider ID, and relative scopes. It never infers a workstream from repository vocabulary and never accepts arbitrary commands, executable paths, environment variables, worktree locations, branch names, or base refs. Terminal output is bounded to 1 MiB per run, input frames are bounded, and the dashboard allows at most eight simultaneous managed sessions.
 
 Path scope is currently a merge-gate invariant, not a filesystem sandbox. Agents work inside an isolated git checkout, but a tool capable of accessing absolute paths can still reach the wider host. PidMesh identifies and blocks out-of-scope repository changes before approval; stronger operating-system containment remains future work.
 
@@ -83,7 +84,7 @@ The local workspace answers five questions in order:
 4. **Can it merge safely?** Process stopped, scope valid, base checkout clean, and base branch unchanged.
 5. **What does the fleet know?** Shared ownership, memory, messages, and the causal event timeline.
 
-The Workspace view is the default task flow. Operations remains available as the fleet-level diagnostic view.
+Workspace is the default IDE with a terminal-first main pane and workstream-grouped runs. Operations remains the fleet-level diagnostic view.
 
 ## Roadmap after 1.4
 

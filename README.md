@@ -65,13 +65,13 @@ pidmesh dashboard
 ```
 
 PidMesh prints a one-time local URL containing the session token and binds only to `127.0.0.1`.
-The default Workspace view is an agent IDE: create a bounded task, select an installed Codex or
-Claude Code profile, reserve its allowed paths, and launch it in a generated branch and isolated git
-worktree. The browser attaches to a real PTY, survives terminal reconnection, browses the worktree,
-shows the unified diff, flags out-of-scope changes, and gates commit/merge approval. The Operations
-view retains live PIDs, claims, path/port/service ownership, shared memory, messages, and the event
-ledger. Use `pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is
-an alias.
+The Workspace view separates concurrent workstreams inside the current repository without guessing
+project names from its contents. Create a bounded task, name its workstream, select an installed
+Codex or Claude Code profile, reserve its allowed paths, and launch it in a generated branch and
+isolated git worktree. Runs stay grouped by workstream in the sidebar; opening one brings its real
+PTY, file tree, change review, and task brief into the main pane. The Operations view retains live
+PIDs, claims, path/port/service ownership, shared memory, messages, and the event ledger. Use
+`pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is an alias.
 
 Launch profiles are resolved and allowlisted by the Rust server. The HTTP API cannot supply an
 arbitrary command, executable, branch, worktree path, base ref, or environment. A run is limited to
@@ -80,10 +80,10 @@ system sandbox: PidMesh refuses approval while changes exist outside the reserve
 
 The primary workflow is:
 
-1. Click **New task** and choose Codex or Claude Code.
+1. Click **New task**, name the workstream, and choose Codex or Claude Code.
 2. Describe the outcome and enter one allowed relative path per line.
-3. Work with the agent through the embedded terminal.
-4. Inspect its Files and Diff tabs.
+3. Track concurrent workstreams in the workspace sidebar and open a run.
+4. Work with the agent through the embedded terminal and inspect Files and Diff.
 5. Stop the agent, resolve any scope violations, then approve and merge.
 
 Managed terminal scrollback and run handles are currently retained in memory for the lifetime of the

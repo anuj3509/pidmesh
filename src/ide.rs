@@ -33,6 +33,7 @@ const TICKET_TTL_MS: i64 = 30_000;
 pub struct LaunchRequest {
     pub name: String,
     pub provider: String,
+    pub workstream: String,
     pub task: String,
     pub prompt: String,
     pub scopes: Vec<String>,
@@ -89,6 +90,7 @@ struct ManagedSession {
     scopes: Vec<String>,
     sender: broadcast::Sender<TerminalChunk>,
     task: String,
+    workstream: String,
     worktree: PathBuf,
     writer: Mutex<Box<dyn Write + Send>>,
 }
@@ -223,6 +225,7 @@ impl IdeManager {
             scopes: request.scopes,
             sender,
             task: request.task,
+            workstream: request.workstream,
             worktree,
             writer: Mutex::new(spawned.writer),
         });
@@ -503,10 +506,11 @@ impl IdeManager {
     }
 
     fn acquire_scope(&self, agent_id: &str, request: &LaunchRequest) -> Result<()> {
+        let task_key = format!("{}:{}", slugify(&request.workstream), request.task);
         let claim =
             self.inner
                 .store
-                .claim(agent_id, &request.task, 86_400, Some("managed IDE session"))?;
+                .claim(agent_id, &task_key, 86_400, Some("managed IDE session"))?;
         ensure!(
             claim["acquired"] == true,
             "task is already claimed by another agent"
@@ -519,12 +523,12 @@ impl IdeManager {
         let reservation = self.inner.store.reserve_resources(
             agent_id,
             &resources,
-            Some(&request.task),
+            Some(&task_key),
             Some("managed IDE scope"),
             86_400,
         )?;
         if reservation["acquired"] != true {
-            let _ = self.inner.store.release(agent_id, &request.task);
+            let _ = self.inner.store.release(agent_id, &task_key);
             bail!("one or more requested paths are reserved by another agent");
         }
         Ok(())
@@ -564,6 +568,7 @@ fn session_view(session: &ManagedSession) -> Result<Value> {
         "agent_id": session.agent_id,
         "name": session.name,
         "provider": session.provider,
+        "workstream": session.workstream,
         "task": session.task,
         "prompt": session.prompt,
         "scopes": session.scopes,
@@ -605,6 +610,7 @@ fn spawn_provider(
     command.env("PIDMESH_AGENT_ID", agent_id);
     command.env("PIDMESH_AGENT_NAME", &request.name);
     command.env("PIDMESH_PROVIDER", &request.provider);
+    command.env("PIDMESH_WORKSTREAM", &request.workstream);
     command.env("PIDMESH_DB", database);
     command.env("PIDMESH_WORKSPACE", repository);
     let mut child = pair
@@ -680,7 +686,8 @@ fn provider_command(provider: &str, executable: &Path, name: &str, prompt: &str)
 
 fn managed_prompt(request: &LaunchRequest) -> String {
     format!(
-        "You are running inside a PidMesh-managed worktree.\nTask: {}\nAllowed paths: {}\nUse PidMesh for shared context and handoffs. Do not change files outside the allowed paths. Finish by summarizing changes and tests.\n\n{}",
+        "You are running inside a PidMesh-managed worktree.\nWorkstream: {}\nTask: {}\nAllowed paths: {}\nUse PidMesh for shared context and handoffs. Do not change files outside the allowed paths. Finish by summarizing changes and tests.\n\n{}",
+        request.workstream,
         request.task,
         request.scopes.join(", "),
         request.prompt.trim()
@@ -689,6 +696,7 @@ fn managed_prompt(request: &LaunchRequest) -> String {
 
 fn validate_launch(request: &LaunchRequest) -> Result<()> {
     validate_short("name", &request.name)?;
+    validate_short("workstream", &request.workstream)?;
     validate_short("task", &request.task)?;
     ensure!(
         !request.prompt.trim().is_empty() && request.prompt.len() <= 64 * 1024,
@@ -1088,12 +1096,14 @@ mod tests {
             LaunchRequest {
                 name: "scope-check".to_owned(),
                 provider: "claude".to_owned(),
+                workstream: "runtime".to_owned(),
                 task: "scope-check".to_owned(),
                 prompt: "Create one allowed and one disallowed file".to_owned(),
                 scopes: vec!["src".to_owned()],
             },
             &provider,
         )?;
+        assert_eq!(launched["workstream"], "runtime");
         let session_id = launched["id"].as_str().context("missing session id")?;
         for _ in 0..40 {
             let active = manager.session(session_id)?;

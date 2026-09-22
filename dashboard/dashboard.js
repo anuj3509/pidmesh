@@ -15,6 +15,7 @@ const state = {
   token: null,
   view: "ide",
   websocket: null,
+  workspaceFilter: "",
 };
 
 const byId = (id) => document.getElementById(id);
@@ -118,32 +119,56 @@ function renderAll() {
 function renderProject() {
   if (!state.snapshot) return;
   const workspace = state.snapshot.workspace || "local";
-  byId("project-name").textContent = basename(workspace);
-  byId("project-branch").textContent = selectedSession()?.base_branch || "local mesh";
+  const project = basename(workspace);
+  byId("project-name").textContent = project;
+  byId("rail-project-name").textContent = project;
+  byId("project-branch").textContent = selectedSession()?.workstream || "local mesh";
 }
 
-function groupedSessions() {
-  return [
-    ["Needs you", ["ready_for_review", "failed", "rejected", "conflict"]],
-    ["Running", ["running", "stopping"]],
-    ["Completed", ["merged", "completed", "stopped"]],
-  ];
+function workstreamName(session) {
+  return String(session.workstream || "Unassigned");
+}
+
+function needsAttention(session) {
+  return ["ready_for_review", "failed", "rejected", "conflict"].includes(session.status) ||
+    (session.out_of_scope || []).length > 0;
+}
+
+function workstreamGroups() {
+  const groups = new Map();
+  for (const session of state.sessions) {
+    const searchable = [session.name, session.provider, session.branch, session.task, workstreamName(session)]
+      .join(" ")
+      .toLowerCase();
+    if (state.workspaceFilter && !searchable.includes(state.workspaceFilter)) continue;
+    const name = workstreamName(session);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(session);
+  }
+  return [...groups.entries()]
+    .map(([name, sessions]) => [name, sessions.sort((left, right) => right.created_at - left.created_at)])
+    .sort((left, right) => {
+      const leftAttention = left[1].some(needsAttention);
+      const rightAttention = right[1].some(needsAttention);
+      if (leftAttention !== rightAttention) return rightAttention - leftAttention;
+      return right[1][0].created_at - left[1][0].created_at;
+    });
 }
 
 function renderSessions() {
   const container = byId("session-groups");
   const groups = [];
-  for (const [label, statuses] of groupedSessions()) {
-    const sessions = state.sessions.filter((session) => statuses.includes(session.status));
-    if (!sessions.length) continue;
+  for (const [label, sessions] of workstreamGroups()) {
     const section = node("section", "session-group");
-    section.append(node("h2", "", label));
+    const heading = node("div", "session-group-heading");
+    heading.append(node("h2", "", label), node("span", "", String(sessions.length)));
+    section.append(heading);
     const list = node("div", "session-group-list");
     for (const session of sessions) {
       const button = node("button", "session-item");
       button.type = "button";
       button.classList.toggle("active", session.id === state.selectedSessionId);
-      button.addEventListener("click", () => selectSession(session.id));
+      button.addEventListener("click", () => openSession(session.id));
       const dot = node("i", `status-dot status-${normalizeStatus(session.status)}`);
       const copy = node("span", "session-item-copy");
       copy.append(node("strong", "", session.name));
@@ -154,15 +179,17 @@ function renderSessions() {
     section.append(list);
     groups.push(section);
   }
-  if (!groups.length) empty(container, "No managed runs yet. Create one to start an isolated agent.", "attention-empty");
+  if (!groups.length) {
+    const message = state.workspaceFilter
+      ? `No workspace matches “${byId("workspace-filter").value.trim()}”.`
+      : "No managed runs yet. Create one to start an isolated agent.";
+    empty(container, message, "attention-empty");
+  }
   else container.replaceChildren(...groups);
 }
 
 function attentionSessions() {
-  return state.sessions.filter((session) =>
-    ["ready_for_review", "failed", "rejected", "conflict"].includes(session.status) ||
-      (session.out_of_scope || []).length > 0,
-  );
+  return state.sessions.filter(needsAttention);
 }
 
 function renderAttention() {
@@ -178,7 +205,7 @@ function renderAttention() {
       const button = node("button", `attention-item ${session.status === "failed" ? "critical" : ""}`);
       button.type = "button";
       button.addEventListener("click", () => {
-        selectSession(session.id);
+        openSession(session.id);
         setWorkbenchTab(session.status === "ready_for_review" ? "diff" : "overview");
       });
       const icon = node("span", "attention-icon", session.status === "failed" ? "!" : "↗");
@@ -202,8 +229,16 @@ async function selectSession(sessionId) {
   state.currentFile = null;
   renderAll();
   closeDrawers();
-  if (changed || !state.terminal) await connectTerminal();
-  await Promise.allSettled([loadReview(), loadFiles(".")]);
+  if (state.view === "ide") {
+    if (changed || !state.terminal) await connectTerminal();
+    await Promise.allSettled([loadReview(), loadFiles(".")]);
+  }
+}
+
+async function openSession(sessionId) {
+  setWorkbenchTab("terminal");
+  await selectSession(sessionId);
+  setAppView("ide");
 }
 
 function renderSelectedSession() {
@@ -213,10 +248,12 @@ function renderSelectedSession() {
   byId("inspector-empty").classList.toggle("hidden", Boolean(session));
   byId("inspector-content").classList.toggle("hidden", !session);
   if (!session) {
-    byId("active-run-title").textContent = "Choose or create a task";
+    byId("active-run-title").textContent = "Choose or create a workspace";
     byId("active-run-subtitle").textContent = "Each agent gets an isolated branch and worktree.";
     byId("active-status").textContent = "No active run";
     byId("active-status-dot").className = "status-dot";
+    byId("activity-diff-count").textContent = "";
+    byId("open-editor-button").disabled = true;
     byId("status-worktree").textContent = "No worktree selected";
     byId("status-process").textContent = "PID —";
     byId("status-changes").textContent = "0 changed files";
@@ -224,12 +261,14 @@ function renderSelectedSession() {
     return;
   }
   const status = normalizeStatus(session.status);
+  byId("open-editor-button").disabled = false;
   byId("active-run-title").textContent = session.name;
-  byId("active-run-subtitle").textContent = session.branch;
+  byId("active-run-subtitle").textContent = `${workstreamName(session)} · ${session.branch}`;
   byId("active-status").textContent = statusLabel(session.status);
   byId("active-status-dot").className = `status-dot status-${status}`;
   byId("task-prompt").textContent = session.prompt;
   renderDetails(byId("execution-details"), [
+    ["Workstream", workstreamName(session)],
     ["Provider", session.provider],
     ["Process", `PID ${session.pid}`],
     ["Status", statusLabel(session.status)],
@@ -241,6 +280,7 @@ function renderSelectedSession() {
   renderInspector(session);
   byId("file-count").textContent = String((session.changed_files || []).length || "");
   byId("diff-count").textContent = String((session.changed_files || []).length || "");
+  byId("activity-diff-count").textContent = String((session.changed_files || []).length || "");
   byId("status-worktree").textContent = session.worktree;
   byId("status-process").textContent = `PID ${session.pid}`;
   byId("status-changes").textContent = `${(session.changed_files || []).length} changed files`;
@@ -266,6 +306,7 @@ function renderDetails(container, values) {
 
 function renderActivity(session) {
   const events = [
+    ["Workstream assigned", workstreamName(session), session.created_at],
     ["Worktree created", session.worktree, session.created_at],
     ["Provider launched", `${session.provider} · PID ${session.pid}`, session.created_at],
   ];
@@ -284,6 +325,7 @@ function renderActivity(session) {
 
 function renderInspector(session) {
   renderDetails(byId("task-details"), [
+    ["Workstream", workstreamName(session)],
     ["Task key", session.task],
     ["Agent", session.agent_id],
     ["Provider", session.provider],
@@ -530,29 +572,79 @@ function setWorkbenchTab(tab) {
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
   });
-  for (const name of ["overview", "files", "diff"]) {
+  for (const name of ["terminal", "overview", "files", "diff"]) {
     byId(`${name}-panel`).classList.toggle("hidden", name !== tab);
   }
   if (tab === "diff") loadReview();
   if (tab === "files") loadFiles(state.currentDirectory);
+  const session = selectedSession();
+  byId("window-title-label").textContent = session ? `${session.name} — ${tab}` : "Local agent workspace";
 }
 
 function setAppView(view) {
+  const previousView = state.view;
   state.view = view;
   byId("ide-view").classList.toggle("hidden", view !== "ide");
   byId("operations-view").classList.toggle("hidden", view !== "operations");
+  byId("mobile-view-select").value = view;
   document.querySelectorAll("[data-app-view]").forEach((button) => {
     const active = button.dataset.appView === view;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
+  if (view === "ide" && previousView !== "ide" && selectedSession()) connectTerminal();
+  if (view !== "ide" && previousView === "ide") disconnectTerminal();
+  if (view === "operations") byId("window-title-label").textContent = "Local agent fleet";
+  renderProject();
 }
 
-function openNewTask() {
+async function copyWorktreePath() {
+  const session = selectedSession();
+  if (!session) {
+    setStatus("Select a workspace first", true);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(session.worktree);
+    setStatus("Worktree path copied");
+  } catch {
+    setStatus(`Worktree: ${session.worktree}`, true);
+  }
+}
+
+function taskSlug(value) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+}
+
+function suggestTaskLabels() {
+  const slug = taskSlug(byId("task-prompt-input").value);
+  for (const id of ["task-name", "task-key"]) {
+    const input = byId(id);
+    if (input.dataset.edited !== "true") input.value = slug;
+  }
+}
+
+function openNewTask(workstream = "") {
+  byId("new-task-form").reset();
+  byId("task-name").dataset.edited = "false";
+  byId("task-key").dataset.edited = "false";
+  byId("task-provider").value = state.providers.find((provider) => provider.available)?.id || "";
   byId("new-task-error").textContent = "";
+  byId("task-workstream").value = workstream;
+  const options = [...new Set(state.sessions.map(workstreamName))].sort().map((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    return option;
+  });
+  byId("workstream-options").replaceChildren(...options);
   updateLaunchPreview();
   byId("new-task-dialog").showModal();
-  byId("task-name").focus();
+  byId("task-prompt-input").focus();
 }
 
 function closeDialog(dialog) {
@@ -566,6 +658,7 @@ async function createTask(event) {
   const request = {
     name: byId("task-name").value.trim(),
     provider: byId("task-provider").value,
+    workstream: byId("task-workstream").value.trim(),
     task: byId("task-key").value.trim(),
     prompt: byId("task-prompt-input").value.trim(),
     scopes,
@@ -578,21 +671,22 @@ async function createTask(event) {
     closeDialog(byId("new-task-dialog"));
     byId("new-task-form").reset();
     await refresh();
-    await selectSession(session.id);
+    await openSession(session.id);
     setStatus(`${session.name} launched in an isolated worktree`);
   } catch (error) {
     byId("new-task-error").textContent = error.message;
   } finally {
     submit.disabled = false;
-    submit.textContent = "Create task";
+    submit.textContent = "Launch workspace";
   }
 }
 
 function updateLaunchPreview() {
   const provider = state.providers.find((item) => item.id === byId("task-provider").value);
+  const workstream = byId("task-workstream").value.trim();
   const scopes = byId("task-scopes").value.split(/\r?\n/).filter((value) => value.trim()).length;
   byId("launch-preview").textContent = provider
-    ? `${provider.name} · generated pidmesh/* branch · isolated worktree · ${scopes || 0} reserved path(s)`
+    ? `${workstream || "Unnamed workstream"} · ${provider.name} · isolated worktree · ${scopes || 0} reserved path(s)`
     : "Choose a provider and describe the task.";
 }
 
@@ -689,11 +783,22 @@ function closeDrawers() {
 }
 
 function bindEvents() {
-  ["new-task-button", "new-task-rail", "empty-new-task"].forEach((id) => byId(id).addEventListener("click", openNewTask));
+  ["new-task-button", "new-task-rail", "empty-new-task", "rail-add-button"].forEach((id) => byId(id).addEventListener("click", () => openNewTask()));
+  document.querySelector(".wordmark").addEventListener("click", (event) => {
+    event.preventDefault();
+    setAppView("ide");
+  });
   byId("new-task-close").addEventListener("click", () => closeDialog(byId("new-task-dialog")));
   byId("new-task-cancel").addEventListener("click", () => closeDialog(byId("new-task-dialog")));
   byId("new-task-form").addEventListener("submit", createTask);
   byId("task-provider").addEventListener("change", updateLaunchPreview);
+  byId("task-prompt-input").addEventListener("input", suggestTaskLabels);
+  for (const id of ["task-name", "task-key"]) {
+    byId(id).addEventListener("input", () => {
+      byId(id).dataset.edited = "true";
+    });
+  }
+  byId("task-workstream").addEventListener("input", updateLaunchPreview);
   byId("task-scopes").addEventListener("input", updateLaunchPreview);
   document.querySelectorAll("[data-workbench-view]").forEach((button) =>
     button.addEventListener("click", () => setWorkbenchTab(button.dataset.workbenchView)),
@@ -701,20 +806,21 @@ function bindEvents() {
   document.querySelectorAll("[data-app-view]").forEach((button) =>
     button.addEventListener("click", () => setAppView(button.dataset.appView)),
   );
+  byId("mobile-view-select").addEventListener("change", (event) => setAppView(event.target.value));
   byId("refresh-button").addEventListener("click", refresh);
+  byId("activity-details").addEventListener("click", openInspector);
+  byId("new-terminal-button").addEventListener("click", () => setWorkbenchTab("terminal"));
+  byId("open-editor-button").addEventListener("click", copyWorktreePath);
+  byId("workspace-filter").addEventListener("input", (event) => {
+    state.workspaceFilter = event.target.value.trim().toLowerCase();
+    renderSessions();
+  });
   byId("operations-refresh").addEventListener("click", refresh);
   byId("files-refresh").addEventListener("click", () => loadFiles(state.currentDirectory));
   byId("copy-file").addEventListener("click", async () => {
     if (state.currentFile) await navigator.clipboard.writeText(state.currentFile.content);
   });
   byId("clear-console").addEventListener("click", () => state.terminal?.reset());
-  byId("console-toggle").addEventListener("click", () => {
-    const drawer = byId("console-drawer");
-    const collapsed = drawer.classList.toggle("collapsed");
-    byId("console-body").classList.toggle("hidden", collapsed);
-    byId("console-toggle").setAttribute("aria-expanded", String(!collapsed));
-    byId("console-toggle").textContent = collapsed ? "⌃" : "⌄";
-  });
   byId("console-input-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const input = byId("console-input");
@@ -743,6 +849,29 @@ function bindEvents() {
       event.preventDefault();
       openNewTask();
     }
+    if ((event.metaKey || event.ctrlKey) && ["1", "2"].includes(event.key)) {
+      event.preventDefault();
+      setAppView({ "1": "ide", "2": "operations" }[event.key]);
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      byId("workspace-filter").focus();
+      byId("workspace-filter").select();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
+      event.preventDefault();
+      if (window.matchMedia("(max-width: 860px)").matches) openRail();
+      else document.body.classList.toggle("rail-collapsed");
+    }
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      copyWorktreePath();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      setAppView("ide");
+      setWorkbenchTab("diff");
+    }
     if (event.key === "Escape") closeDrawers();
   });
   window.addEventListener("beforeunload", disconnectTerminal);
@@ -767,7 +896,10 @@ async function initialize() {
     else select.insertBefore(Object.assign(node("option", "", "No supported agent CLI found"), { value: "" }), select.firstChild);
     updateLaunchPreview();
     await refresh();
-    if (state.selectedSessionId) await selectSession(state.selectedSessionId);
+    if (state.selectedSessionId && state.view === "ide") {
+      setWorkbenchTab("terminal");
+      await selectSession(state.selectedSessionId);
+    }
     scheduleRefresh();
   } catch (error) {
     setConnection(false);

@@ -935,7 +935,7 @@ fn assert_ide_api_security(address: &str, authorization: &str) -> Result<()> {
         "POST",
         "/api/v1/ide/sessions",
         &[("Authorization", authorization)],
-        r#"{"name":"blocked","provider":"claude","task":"blocked","prompt":"blocked","scopes":["src"]}"#,
+        r#"{"name":"blocked","provider":"claude","workstream":"runtime","task":"blocked","prompt":"blocked","scopes":["src"]}"#,
     )?;
     assert_eq!(launch_without_origin.0, 403);
     Ok(())
