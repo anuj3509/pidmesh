@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use pidmesh::converge::scan_worktree;
@@ -359,5 +359,136 @@ fn two_sessions_sharing_a_checkout_are_one_editor_not_a_collision() -> Result<()
         report["collision_count"], 0,
         "one checkout cannot collide with itself"
     );
+    Ok(())
+}
+
+/// Contributing guide: transaction changes need multiprocess coverage.
+///
+/// Eight independent processes scan eight worktrees and publish footprints concurrently against one
+/// SQLite database. Every write must land, and the contested path must end up with exactly eight
+/// participants rather than a torn or partially-overwritten set.
+#[test]
+fn eight_processes_publish_footprints_concurrently() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let repository = directory.path().join("repository");
+    let database = directory.path().join("footprints.db");
+    let binary = env!("CARGO_BIN_EXE_pidmesh");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init", "-b", "main"])?;
+    git(
+        &repository,
+        &["config", "user.email", "pidmesh@example.com"],
+    )?;
+    git(&repository, &["config", "user.name", "PidMesh Test"])?;
+    std::fs::create_dir(repository.join("src"))?;
+    std::fs::write(repository.join("src/shared.rs"), "fn shared() {}\n")?;
+    git(&repository, &["add", "-A"])?;
+    git(&repository, &["commit", "-m", "initial"])?;
+
+    let mut workers = Vec::new();
+    for worker in 0..8 {
+        let worktree = directory.path().join(format!("wt-{worker}"));
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("feat/{worker}"),
+                worktree.to_str().context("worktree path")?,
+            ],
+        )?;
+        // Every worktree edits the same path differently, plus one path of its own.
+        std::fs::write(
+            worktree.join("src/shared.rs"),
+            format!("fn shared() {{ /* {worker} */ }}\n"),
+        )?;
+        std::fs::write(worktree.join(format!("src/only-{worker}.rs")), "private\n")?;
+        // Join from inside the checkout so linked-worktree discovery unifies the mesh.
+        let output = Command::new(binary)
+            .current_dir(&worktree)
+            .env_remove("PIDMESH_WORKSPACE")
+            .args([
+                "--db",
+                database.to_str().context("database path")?,
+                "join",
+                "--name",
+                &format!("worker-{worker}"),
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let registration: Value = serde_json::from_slice(&output.stdout)?;
+        workers.push((
+            registration["agent_id"]
+                .as_str()
+                .context("agent id")?
+                .to_owned(),
+            worktree,
+        ));
+    }
+
+    let mut children = Vec::new();
+    for (agent_id, worktree) in &workers {
+        children.push(
+            Command::new(binary)
+                .current_dir(worktree)
+                .env_remove("PIDMESH_WORKSPACE")
+                .args([
+                    "--db",
+                    database.to_str().context("database path")?,
+                    "sync",
+                    "--agent",
+                    agent_id,
+                    "--base",
+                    "main",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+    }
+    for child in children {
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "concurrent sync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = Command::new(binary)
+        .current_dir(&workers[0].1)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "collisions",
+            "--agent",
+            &workers[0].0,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let collisions = report["collisions"].as_array().context("collisions")?;
+    assert_eq!(
+        collisions.len(),
+        1,
+        "only the shared path is contested: {report}"
+    );
+    assert_eq!(collisions[0]["path"], "src/shared.rs");
+    assert_eq!(
+        collisions[0]["participants"].as_array().map(Vec::len),
+        Some(8),
+        "every concurrent write must survive"
+    );
+    assert_eq!(collisions[0]["severity"], "divergent");
     Ok(())
 }
