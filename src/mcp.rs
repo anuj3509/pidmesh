@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::converge::scan_worktree;
 use crate::store::MeshStore;
 
 #[derive(Clone)]
@@ -52,6 +53,12 @@ struct InboxParams {
     acknowledge: bool,
     #[serde(default = "default_inbox_limit")]
     limit: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SyncParams {
+    /// Integration branch to measure against; defaults to main, then master.
+    base: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -113,6 +120,7 @@ impl PidMeshMcp {
             "resources",
             "events",
             "wait",
+            "convergence",
         ]
         .map(str::to_owned);
         let managed_agent = env::var("PIDMESH_AGENT_ID").ok();
@@ -319,12 +327,30 @@ impl PidMeshMcp {
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         tool_result(result)
     }
+
+    #[tool(
+        description = "Publish what this checkout actually changed and report paths contested by other agents"
+    )]
+    fn sync_footprint(
+        &self,
+        Parameters(parameters): Parameters<SyncParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = checkout_directory()
+            .and_then(|directory| scan_worktree(&directory, parameters.base.as_deref()))
+            .and_then(|scan| self.store.publish_footprint(&self.agent_id, &scan));
+        tool_result(result)
+    }
+
+    #[tool(description = "Report paths contested by more than one agent's observed footprint")]
+    fn collisions(&self) -> Result<CallToolResult, McpError> {
+        tool_result(self.store.collisions(&self.agent_id))
+    }
 }
 
 #[tool_handler(
     name = "PidMesh",
-    version = "1.4.0",
-    instructions = "Check status and inbox, claim a task, reserve intended paths before editing, and record decisions as memories."
+    version = "1.5.0",
+    instructions = "Check status and inbox, claim a task, reserve intended paths before editing, and record decisions as memories. Call sync_footprint after each round of edits so other agents can see what this checkout actually changed, and read collisions before continuing work on a contested path."
 )]
 impl ServerHandler for PidMeshMcp {}
 
@@ -333,6 +359,14 @@ fn tool_result(result: Result<Value>) -> Result<CallToolResult, McpError> {
         Ok(value) => CallToolResult::structured(value),
         Err(error) => CallToolResult::structured_error(json!({"error": format!("{error:#}")})),
     })
+}
+
+/// The checkout this server observes: the configured workspace, else the process directory.
+fn checkout_directory() -> Result<PathBuf> {
+    match env::var_os("PIDMESH_WORKSPACE") {
+        Some(workspace) => Ok(PathBuf::from(workspace)),
+        None => Ok(env::current_dir()?),
+    }
 }
 
 fn default_kind() -> String {

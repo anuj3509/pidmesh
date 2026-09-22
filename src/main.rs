@@ -11,6 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use pidmesh::converge::scan_worktree;
 use pidmesh::store::{MeshStore, default_database_path, workspace_root};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -120,6 +121,22 @@ enum Commands {
     Unreserve {
         #[arg(required = true)]
         resources: Vec<String>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Observe this checkout and publish what it actually changed.
+    Sync {
+        #[arg(long)]
+        agent: Option<String>,
+        /// Integration branch to measure against; defaults to main, then master.
+        #[arg(long)]
+        base: Option<String>,
+        /// Checkout to observe; defaults to the current directory.
+        #[arg(long)]
+        checkout: Option<PathBuf>,
+    },
+    /// Report paths contested by more than one agent's observed footprint.
+    Collisions {
         #[arg(long)]
         agent: Option<String>,
     },
@@ -316,6 +333,21 @@ fn run() -> Result<u8> {
         Commands::Unreserve { resources, agent } => emit(&json!({
             "released": store.release_resources(&agent_id(agent.as_deref())?, &resources)?
         }))?,
+        Commands::Sync {
+            agent,
+            base,
+            checkout,
+        } => {
+            let directory = match checkout {
+                Some(path) => path,
+                None => std::env::current_dir()?,
+            };
+            let scan = scan_worktree(&directory, base.as_deref())?;
+            emit(&store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?)?;
+        }
+        Commands::Collisions { agent } => {
+            emit(&store.collisions(&agent_id(agent.as_deref())?)?)?;
+        }
         Commands::Status { agent, workspace } => {
             emit(&store.status(agent.as_deref(), workspace.as_deref())?)?;
         }

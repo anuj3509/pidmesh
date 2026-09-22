@@ -64,6 +64,52 @@ Resource reservations are cooperative collision prevention, not filesystem or ne
 Participating agents must reserve intended resources before modifying or binding them. Symlink aliases
 that point to the same target can still appear as distinct lexical paths.
 
+## Footprints and collisions
+
+A reservation is a declaration of intent. A footprint is an observation of fact: the set of paths a
+checkout has actually changed relative to an integration base, derived entirely from git and
+requiring no cooperation from the agent beyond pointing the scan at a directory.
+
+A scan resolves the integration base (`main`, then `master`, unless one is named), takes the merge
+base against `HEAD`, and unions committed changes since that base with uncommitted changes including
+untracked files. Uncommitted state wins where both describe the same path.
+
+The filesystem, not the git status letter, decides whether a path still exists: git reports a
+staged file that has since been deleted as added, and a path can vanish between the status call and
+the scan, so a reported path that is absent is recorded as deleted.
+
+Each surviving path is fingerprinted from its bytes so identical content is distinguishable from
+divergent content. The digest is mesh-internal and is not a git object id; it only ever has to
+answer whether two checkouts hold the same content. Anything without comparable content carries no
+digest — a deletion, a directory, a submodule, a nested repository, a symlink, an unreadable or
+oversized file, or a path whose name is not valid UTF-8 — and a missing digest is treated as
+divergent, which is the conservative direction. One unreadable path never fails a scan.
+
+Publishing a footprint replaces every row previously recorded for that agent in one immediate
+transaction. The footprint is therefore authoritative: withdrawing a change removes the agent from
+that path's contention on its next scan, and an agent that merges and cleans its checkout leaves
+every collision automatically.
+
+Contention is keyed on checkout rather than agent, in the participant list as well as in the test
+for whether a path is contested. A worker that runs both a CLI session and an MCP session against
+one worktree is a single editor of that path, and only its most recent observation counts;
+otherwise a stale footprint from a co-located session would argue with its own checkout. A path
+changed in more than one checkout is classified by merge outcome rather than by lock
+ownership. `identical` means every participant reached the same outcome: the same content hash, or every
+checkout deleting the path. `delete_edit` means at least one participant removed the path while
+another still edits it, and outranks content comparison. Everything else is `divergent`. Collisions separately report whether the participants
+cut their checkouts from different base commits, because a stale base is how a textually clean merge
+still produces incorrect behaviour.
+
+Collisions are fingerprinted by severity and participant set. A fingerprint that appears or changes
+appends `collision.detected`; one that disappears appends `collision.cleared`. Unchanged state
+appends neither, so agents polling the mesh in a loop generate no event churn while waking
+immediately on a real overlap.
+
+Footprints survive an agent being marked stopped, because PidMesh deliberately preserves worktrees
+and their uncommitted work. Collision reports carry each participant's session status so a reader
+can tell live contention from abandoned contention.
+
 ## Event stream
 
 Every coordination mutation appends an event with a monotonically increasing sequence. Consumers can
