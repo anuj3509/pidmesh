@@ -72,22 +72,32 @@ requiring no cooperation from the agent beyond pointing the scan at a directory.
 
 A scan resolves the integration base (`main`, then `master`, unless one is named), takes the merge
 base against `HEAD`, and unions committed changes since that base with uncommitted changes including
-untracked files. Uncommitted state wins where both describe the same path. Each surviving path is
-hashed with `git hash-object` so identical content is distinguishable from divergent content. A
-deleted path carries no digest, and neither does a path whose name contains a newline; both are
-treated as divergent, which is the conservative direction.
+untracked files. Uncommitted state wins where both describe the same path.
+
+The filesystem, not the git status letter, decides whether a path still exists: git reports a
+staged file that has since been deleted as added, and a path can vanish between the status call and
+the scan, so a reported path that is absent is recorded as deleted.
+
+Each surviving path is fingerprinted from its bytes so identical content is distinguishable from
+divergent content. The digest is mesh-internal and is not a git object id; it only ever has to
+answer whether two checkouts hold the same content. Anything without comparable content carries no
+digest — a deletion, a directory, a submodule, a nested repository, a symlink, an unreadable or
+oversized file, or a path whose name is not valid UTF-8 — and a missing digest is treated as
+divergent, which is the conservative direction. One unreadable path never fails a scan.
 
 Publishing a footprint replaces every row previously recorded for that agent in one immediate
 transaction. The footprint is therefore authoritative: withdrawing a change removes the agent from
 that path's contention on its next scan, and an agent that merges and cleans its checkout leaves
 every collision automatically.
 
-Contention is keyed on checkout rather than agent. A worker that runs both a CLI session and an
-MCP session against one worktree is a single editor of that path, not two. A path changed in more
-than one checkout is classified by merge outcome rather than by lock
-ownership. `identical` means every participant produced the same content hash. `delete_edit` means
-at least one participant removed the path while another still edits it, and outranks content
-comparison. Everything else is `divergent`. Collisions separately report whether the participants
+Contention is keyed on checkout rather than agent, in the participant list as well as in the test
+for whether a path is contested. A worker that runs both a CLI session and an MCP session against
+one worktree is a single editor of that path, and only its most recent observation counts;
+otherwise a stale footprint from a co-located session would argue with its own checkout. A path
+changed in more than one checkout is classified by merge outcome rather than by lock
+ownership. `identical` means every participant reached the same outcome: the same content hash, or every
+checkout deleting the path. `delete_edit` means at least one participant removed the path while
+another still edits it, and outranks content comparison. Everything else is `divergent`. Collisions separately report whether the participants
 cut their checkouts from different base commits, because a stale base is how a textually clean merge
 still produces incorrect behaviour.
 

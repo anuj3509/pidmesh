@@ -1591,20 +1591,32 @@ fn workspace_collisions(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<(String, Vec<Participant>)>> {
+    // One checkout gets one opinion per path. Several sessions can occupy a worktree, so without
+    // collapsing them first a stale footprint from a co-located session would argue with its own
+    // checkout and fabricate a divergent collision. Deduplicating here rather than only in the
+    // contested-path test keeps the participant list and the contention test derived from the
+    // same rows.
     let mut statement = connection.prepare(
-        "SELECT f.path, f.agent_id, a.name, a.status, f.change_kind,
-                f.digest, f.base_commit, f.branch
-         FROM footprints f
-         JOIN agents a ON a.id = f.agent_id
-         WHERE f.workspace_id = ?1
-           AND f.path IN (
-               SELECT f2.path FROM footprints f2
-               JOIN agents a2 ON a2.id = f2.agent_id
-               WHERE f2.workspace_id = ?1
-               GROUP BY f2.path
-               HAVING COUNT(DISTINCT COALESCE(a2.checkout_path, f2.agent_id)) > 1
+        "WITH ranked AS (
+             SELECT f.path AS path, f.agent_id AS agent_id, a.name AS agent_name,
+                    a.status AS status, f.change_kind AS change_kind, f.digest AS digest,
+                    f.base_commit AS base_commit, f.branch AS branch,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY f.path, COALESCE(a.checkout_path, f.agent_id)
+                        ORDER BY f.observed_at DESC, f.agent_id
+                    ) AS position
+             FROM footprints f
+             JOIN agents a ON a.id = f.agent_id
+             WHERE f.workspace_id = ?1
+         )
+         SELECT path, agent_id, agent_name, status, change_kind, digest, base_commit, branch
+         FROM ranked
+         WHERE position = 1
+           AND path IN (
+               SELECT path FROM ranked WHERE position = 1
+               GROUP BY path HAVING COUNT(*) > 1
            )
-         ORDER BY f.path, f.agent_id",
+         ORDER BY path, agent_id",
     )?;
     let rows = statement.query_map(params![workspace_id], |row| {
         Ok((

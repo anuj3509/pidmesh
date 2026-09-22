@@ -6,14 +6,19 @@
 //! beyond being pointed at a directory.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
+use uuid::Uuid;
 
 /// Branches consulted, in order, when the caller does not name an integration base.
 const DEFAULT_BASE_REFS: [&str; 2] = ["main", "master"];
+
+/// Files above this size are not fingerprinted; they are reported as divergent instead, which is
+/// the conservative direction.
+const MAX_HASHED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How a path was changed inside a worktree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +108,11 @@ pub fn classify(participants: &[Participant]) -> &'static str {
     if deleting && editing {
         return "delete_edit";
     }
+    if deleting {
+        // Every checkout removed the path. Deletions carry no digest, so without this the
+        // content comparison below would fall through and call a clean merge divergent.
+        return "identical";
+    }
     let first = participants
         .first()
         .and_then(|participant| participant.digest.as_deref());
@@ -142,10 +152,9 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         .ok()
         .filter(|name| name != "HEAD" && !name.is_empty());
     let base_ref = resolve_base_ref(checkout, base_ref)?;
-    let base_commit =
-        git_text(checkout, &["merge-base", &base_ref, "HEAD"]).with_context(|| {
-            format!("no merge base between HEAD and {base_ref}; pass an explicit --base")
-        })?;
+    let base_commit = git_text(checkout, &["merge-base", &base_ref, "HEAD"]).map_err(|_| {
+        anyhow!("no merge base between HEAD and {base_ref}; a checkout with no commits cannot be scanned")
+    })?;
 
     // Later sources overwrite earlier ones, so uncommitted state wins over committed state.
     let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
@@ -156,19 +165,32 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         kinds.insert(path, kind);
     }
 
-    let hashable: Vec<String> = kinds
-        .iter()
-        .filter(|(path, kind)| **kind != ChangeKind::Deleted && !path.contains('\n'))
-        .map(|(path, _)| path.clone())
-        .collect();
-    let mut digests = hash_objects(checkout, &hashable)?;
-
     let entries = kinds
         .into_iter()
-        .map(|(path, change_kind)| FootprintEntry {
-            digest: digests.remove(&path),
-            path,
-            change_kind,
+        .map(|(path, reported)| {
+            // A lossily-decoded name does not address a real file, so trust neither the
+            // filesystem lookup nor the digest for it.
+            let addressable = !path.contains('\u{fffd}');
+            let absolute = checkout.join(&path);
+            let present = addressable && fs::symlink_metadata(&absolute).is_ok();
+            // git reports a path as added or modified that can already be gone: a staged file
+            // deleted from the worktree, or one removed since the status call. The filesystem is
+            // the authority on which it is.
+            let change_kind = if addressable && !present {
+                ChangeKind::Deleted
+            } else {
+                reported
+            };
+            let digest = if change_kind == ChangeKind::Deleted || !addressable {
+                None
+            } else {
+                digest_of(&absolute)
+            };
+            FootprintEntry {
+                path,
+                change_kind,
+                digest,
+            }
         })
         .collect();
     Ok(WorktreeScan {
@@ -182,6 +204,12 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
 /// Pick the integration branch to measure against.
 fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> {
     if let Some(requested) = requested {
+        // Reject a leading dash rather than passing `--`, which would make git read the ref as
+        // a pathspec instead of a revision.
+        ensure!(
+            !requested.starts_with('-'),
+            "base ref must not start with a dash: {requested}"
+        );
         ensure!(
             git_text(checkout, &["rev-parse", "--verify", "--quiet", requested]).is_ok(),
             "base ref not found in checkout: {requested}"
@@ -250,45 +278,29 @@ fn uncommitted_changes(checkout: &Path) -> Result<Vec<(String, ChangeKind)>> {
         .collect())
 }
 
-/// Hash the working-tree content of each path in one git process.
-fn hash_objects(checkout: &Path, paths: &[String]) -> Result<BTreeMap<String, String>> {
-    if paths.is_empty() {
-        return Ok(BTreeMap::new());
+/// Fingerprint a path's current bytes.
+///
+/// This is a mesh-internal digest, not a git object id: it only ever has to answer whether two
+/// checkouts hold the same content. Hashing in process rather than shelling out to
+/// `git hash-object --stdin-paths` matters for three reasons. That subprocess deadlocks once the
+/// change set is large enough for its unread stdout to fill the pipe while the parent is still
+/// writing paths to its stdin; it aborts the entire scan when any single path cannot be read,
+/// which an ordinary staged-then-deleted file or a dirty submodule is enough to cause; and it
+/// C-unquotes a leading quote, silently returning another file's digest.
+///
+/// Anything without comparable content — a directory, a submodule, a nested repository, a
+/// symlink, an unreadable or oversized file — yields `None`, which classifies as divergent.
+fn digest_of(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_HASHED_BYTES {
+        return None;
     }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(checkout)
-        .args(["hash-object", "--stdin-paths"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("git hash-object stdin unavailable"))?;
-        for path in paths {
-            writeln!(stdin, "{path}")?;
-        }
-    }
-    let output = child.wait_with_output()?;
-    ensure!(
-        output.status.success(),
-        "git hash-object failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let digests: Vec<String> = String::from_utf8(output.stdout)?
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    ensure!(
-        digests.len() == paths.len(),
-        "git hash-object returned {} digests for {} paths",
-        digests.len(),
-        paths.len()
-    );
-    Ok(paths.iter().cloned().zip(digests).collect())
+    let content = fs::read(path).ok()?;
+    Some(
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, &content)
+            .simple()
+            .to_string(),
+    )
 }
 
 /// Split NUL-terminated git output, dropping the trailing empty field.

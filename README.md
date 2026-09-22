@@ -147,7 +147,7 @@ Each contested path is classified by what would actually happen on merge:
 
 | Severity | Meaning |
 | --- | --- |
-| `identical` | Several agents produced byte-identical content: duplicated effort, safe to merge. |
+| `identical` | Every checkout reached the same outcome — byte-identical content, or all of them deleting the path: duplicated effort, safe to merge. |
 | `divergent` | The same path holds different content in different checkouts. This is the case that silently overwrites work. |
 | `delete_edit` | One agent removed a path another is still editing. Git merges this without complaint in several common orderings. |
 

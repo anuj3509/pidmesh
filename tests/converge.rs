@@ -520,3 +520,185 @@ fn eight_processes_publish_footprints_concurrently() -> Result<()> {
     assert_eq!(collisions[0]["severity"], "divergent");
     Ok(())
 }
+
+/// Regression: a large change set used to deadlock.
+///
+/// Hashing shelled out to `git hash-object --stdin-paths` and wrote every path to its stdin
+/// before reading any stdout. Once the child's unread output filled the pipe it stopped reading,
+/// the parent filled the stdin pipe, and both blocked forever with no timeout. `pidmesh sync`
+/// hung unkillable, and a `watch` sweep froze convergence for the whole fleet.
+#[test]
+fn a_large_change_set_does_not_hang_the_scan() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let bulk = alpha_tree.join("bulk");
+    std::fs::create_dir(&bulk)?;
+    // Comfortably past the observed stall threshold in both bytes and count.
+    for index in 0..9_000 {
+        std::fs::write(
+            bulk.join(format!("file-with-a-fairly-long-name-{index:06}.txt")),
+            "x".repeat(40),
+        )?;
+    }
+    let report = fleet.sync(&alpha, &alpha_tree)?;
+    assert_eq!(report["paths"], 9_000);
+    Ok(())
+}
+
+/// Regression: one unhashable path used to abort the whole scan.
+///
+/// `git hash-object` dies on the first path it cannot read, and that failure was turned into a
+/// scan-wide error. A staged-then-deleted file, a dirty submodule, or an untracked nested
+/// repository was enough to make a checkout permanently unscannable.
+#[test]
+fn an_unreadable_path_degrades_to_no_digest_instead_of_failing() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+
+    // Staged, then removed from the worktree: git reports `AD`, the file is not there.
+    std::fs::write(alpha_tree.join("src/staged.rs"), "staged\n")?;
+    git(&alpha_tree, &["add", "src/staged.rs"])?;
+    std::fs::remove_file(alpha_tree.join("src/staged.rs"))?;
+
+    // An untracked nested repository, which `-uall` reports as a single directory entry.
+    let nested = alpha_tree.join("vendor");
+    std::fs::create_dir(&nested)?;
+    git(&nested, &["init", "-b", "main"])?;
+    std::fs::write(nested.join("inner.txt"), "inner\n")?;
+
+    // A real edit alongside them must still be observed.
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+
+    let scan = scan_worktree(&alpha_tree, Some("main"))?;
+    let shared = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == "src/shared.rs")
+        .context("the ordinary edit must survive")?;
+    assert!(shared.digest.is_some(), "a readable file is still hashed");
+
+    let staged = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == "src/staged.rs")
+        .context("the staged-then-deleted path is still reported")?;
+    assert_eq!(
+        staged.change_kind.as_str(),
+        "deleted",
+        "the filesystem decides, not the git status letter"
+    );
+    assert!(staged.digest.is_none());
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    Ok(())
+}
+
+/// Regression: a filename starting with a quote used to take another file's digest.
+///
+/// `git hash-object --stdin-paths` C-unquotes any line beginning with `"`, so the footprint for
+/// `"quoted.txt"` silently recorded the digest of `quoted.txt`. Two checkouts holding different
+/// bytes could then be reported `identical`, which reads as safe to merge.
+#[test]
+fn a_quoted_filename_does_not_borrow_another_files_digest() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (_alpha, alpha_tree) = fleet.agent("alpha")?;
+    std::fs::write(alpha_tree.join("quoted.txt"), "plain contents\n")?;
+    std::fs::write(alpha_tree.join("\"quoted.txt\""), "different contents\n")?;
+
+    let scan = scan_worktree(&alpha_tree, Some("main"))?;
+    let plain = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == "quoted.txt")
+        .and_then(|entry| entry.digest.clone());
+    let quoted = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == "\"quoted.txt\"")
+        .and_then(|entry| entry.digest.clone());
+    assert!(plain.is_some() && quoted.is_some(), "both are hashed");
+    assert_ne!(plain, quoted, "different bytes must never share a digest");
+    Ok(())
+}
+
+/// Regression: a stale footprint from a co-located session used to argue with its own checkout.
+///
+/// The contested-path test collapsed agents by checkout but the participant query did not, so a
+/// second session in the same worktree contributed an independent opinion. Two byte-identical
+/// checkouts were reported `divergent`, the severity that means work is being overwritten.
+#[test]
+fn a_stale_session_in_one_checkout_does_not_fabricate_divergence() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (first, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    let second = fleet.store.register_agent(
+        "alpha-mcp",
+        std::process::id(),
+        Some(&fleet.repository),
+        "test",
+        &[],
+        None,
+    )?;
+    let second = second["agent_id"]
+        .as_str()
+        .context("missing agent id")?
+        .to_owned();
+    fleet
+        .store
+        .update_agent_checkout(&second, &alpha_tree, Some("feat/alpha"))?;
+
+    // The first session records one version, then the file changes underneath it.
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* v1 */ }\n",
+    )?;
+    fleet.sync(&first, &alpha_tree)?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* v2 */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* v2 */ }\n",
+    )?;
+    fleet.sync(&second, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&bravo)?;
+    let shared = at(&collisions, "src/shared.rs").context("expected a collision")?;
+    assert_eq!(
+        shared["severity"], "identical",
+        "both worktrees hold the same bytes: {shared}"
+    );
+    assert_eq!(
+        shared["participants"].as_array().map(Vec::len),
+        Some(2),
+        "one opinion per checkout, not per session"
+    );
+    Ok(())
+}
+
+/// Regression: two agents deleting the same file were reported as divergent.
+///
+/// Deletions carry no digest, so delete/delete fell past the `delete_edit` branch and past the
+/// content comparison into `divergent`. Removing the same dead file on two branches merges
+/// cleanly; flagging it as the top severity is a false positive in ordinary cleanup work.
+#[test]
+fn two_agents_deleting_the_same_file_do_not_conflict() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::remove_file(alpha_tree.join("src/legacy.rs"))?;
+    std::fs::remove_file(bravo_tree.join("src/legacy.rs"))?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&alpha)?;
+    let legacy = at(&collisions, "src/legacy.rs").context("expected a collision")?;
+    assert_eq!(legacy["severity"], "identical", "{legacy}");
+    Ok(())
+}
