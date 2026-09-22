@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pidmesh::converge::scan_worktree;
+use pidmesh::converge::{integration_head, scan_worktree};
 use pidmesh::store::MeshStore;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1001,5 +1001,154 @@ fn a_worktree_removed_after_its_agent_died_stops_contesting() -> Result<()> {
         .filter(|event| event["event_type"] == "collision.cleared")
         .count();
     assert_eq!(cleared, 1, "the reaper announces what it cleared");
+    Ok(())
+}
+
+/// Merge readiness for one agent, with the integration head resolved from git.
+fn readiness(fleet: &Fleet, agent_id: &str, worktree: &Path) -> Result<Value> {
+    let (_, head) = integration_head(worktree, Some("main"))?;
+    fleet.store.merge_readiness(agent_id, &head)
+}
+
+fn blocker_codes(readiness: &Value) -> Vec<String> {
+    readiness["blockers"]
+        .as_array()
+        .map(|blockers| {
+            blockers
+                .iter()
+                .filter_map(|blocker| blocker["code"].as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_path_contested_by_a_live_peer_blocks_a_merge() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+    assert!(blocker_codes(&report).contains(&"contested_path".to_owned()));
+    Ok(())
+}
+
+#[test]
+fn duplicated_work_does_not_block_a_merge() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    // Byte-identical edits collide, but merging either one is safe.
+    std::fs::write(alpha_tree.join("src/shared.rs"), "fn shared() { same() }\n")?;
+    std::fs::write(bravo_tree.join("src/shared.rs"), "fn shared() { same() }\n")?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], true, "{report}");
+    Ok(())
+}
+
+/// A stopped peer's preserved worktree is still a reported collision, but it cannot rebase and
+/// must not deadlock the queue behind it.
+#[test]
+fn a_stopped_peer_does_not_block_a_merge() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], false);
+
+    fleet.store.stop_agent(&bravo)?;
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], true, "{report}");
+    assert!(
+        !fleet.collisions(&alpha)?.is_empty(),
+        "the collision is still reported, it just no longer blocks"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_worktree_cut_before_the_branch_moved_cannot_merge_until_rebased() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    git(&alpha_tree, &["commit", "-am", "alpha work"])?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
+
+    // Someone lands on main. Alpha's diff may still apply cleanly and be wrong.
+    std::fs::write(fleet.repository.join("src/legacy.rs"), "landed\n")?;
+    git(&fleet.repository, &["commit", "-am", "land upstream"])?;
+
+    let stale = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(stale["mergeable"], false, "{stale}");
+    assert!(blocker_codes(&stale).contains(&"stale_base".to_owned()));
+
+    // Rebasing resolves it, which is the whole point of reporting it.
+    git(&alpha_tree, &["rebase", "main"])?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    let rebased = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(rebased["mergeable"], true, "{rebased}");
+    Ok(())
+}
+
+#[test]
+fn the_integration_lease_admits_one_merge_at_a_time() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    // Disjoint work: nothing but the lease can separate them.
+    std::fs::write(alpha_tree.join("src/only-alpha.rs"), "a\n")?;
+    std::fs::write(bravo_tree.join("src/only-bravo.rs"), "b\n")?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
+    assert_eq!(readiness(&fleet, &bravo, &bravo_tree)?["mergeable"], true);
+
+    let taken = fleet
+        .store
+        .claim(&bravo, pidmesh::store::INTEGRATION_TASK_KEY, 300, None)?;
+    assert_eq!(taken["acquired"], true);
+
+    let blocked = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(blocked["mergeable"], false, "{blocked}");
+    assert!(blocker_codes(&blocked).contains(&"integration_held".to_owned()));
+
+    let holder = readiness(&fleet, &bravo, &bravo_tree)?;
+    assert_eq!(
+        holder["mergeable"], true,
+        "the holder is not blocked by itself"
+    );
+    assert_eq!(holder["holds_integration_lease"], true);
+
+    fleet
+        .store
+        .release(&bravo, pidmesh::store::INTEGRATION_TASK_KEY)?;
+    assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
     Ok(())
 }

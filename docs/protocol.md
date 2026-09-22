@@ -120,6 +120,27 @@ agents launched by an arbitrary harness. A sweep scans each distinct checkout on
 how many sessions occupy it, skips checkouts that have been removed, and ignores sessions whose
 process is gone.
 
+## Merge ordering
+
+A collision report states that two checkouts disagree. Merge readiness decides whether one of them
+may land. The caller supplies the integration branch's current head, because resolving a ref is a
+git question rather than a mesh one, and the mesh compares it against the commit the worktree was
+cut from.
+
+Three conditions block a merge. A stale base means the integration branch advanced after this
+worktree was cut, so the diff may apply cleanly and still be wrong. A contested path means another
+live checkout holds different content on a path this one changed. A held integration lease means
+another agent is merging at this moment.
+
+Two things deliberately do not block. Byte-identical content is duplicated effort, so merging
+either copy is safe. A peer that is no longer running does not block either: its preserved worktree
+is still reported as a collision, but it cannot be asked to rebase, and treating it as a blocker
+would deadlock every later merge behind an agent that has already exited.
+
+The integration lease is an ordinary claim under a reserved task key rather than a new mechanism.
+It therefore inherits exactly-one-owner semantics, lease expiry so a crashed holder cannot wedge
+the queue permanently, and release through the existing agent lifecycle.
+
 ## Event stream
 
 Every coordination mutation appends an event with a monotonically increasing sequence. Consumers can

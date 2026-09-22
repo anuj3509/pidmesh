@@ -12,8 +12,10 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use pidmesh::converge::scan_worktree;
-use pidmesh::store::{AgentCheckout, MeshStore, default_database_path, diagnose, workspace_root};
+use pidmesh::converge::{integration_head, scan_worktree};
+use pidmesh::store::{
+    AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, default_database_path, diagnose, workspace_root,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -140,6 +142,25 @@ enum Commands {
     Collisions {
         #[arg(long)]
         agent: Option<String>,
+    },
+    /// Decide whether this agent can merge without breaking another checkout.
+    Mergeable {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        checkout: Option<PathBuf>,
+    },
+    /// Take or release the workspace-wide integration lease that serializes merges.
+    Integrate {
+        #[arg(long)]
+        agent: Option<String>,
+        /// Release the lease instead of taking it.
+        #[arg(long)]
+        release: bool,
+        #[arg(long, default_value_t = 900)]
+        lease_seconds: u64,
     },
     /// Check that this workspace is actually one shared mesh.
     Doctor {
@@ -371,6 +392,47 @@ fn run() -> Result<u8> {
         }
         Commands::Collisions { agent } => {
             emit(&store.collisions(&agent_id(agent.as_deref())?)?)?;
+        }
+        Commands::Mergeable {
+            agent,
+            base,
+            checkout,
+        } => {
+            let directory = match checkout {
+                Some(path) => path,
+                None => std::env::current_dir()?,
+            };
+            let (_, head) = integration_head(&directory, base.as_deref())?;
+            let readiness = store.merge_readiness(&agent_id(agent.as_deref())?, &head)?;
+            let mergeable = readiness["mergeable"] == true;
+            emit(&readiness)?;
+            if !mergeable {
+                return Ok(1);
+            }
+        }
+        Commands::Integrate {
+            agent,
+            release,
+            lease_seconds,
+        } => {
+            let agent = agent_id(agent.as_deref())?;
+            if release {
+                emit(&json!({
+                    "released": store.release(&agent, INTEGRATION_TASK_KEY)?
+                }))?;
+            } else {
+                let claimed = store.claim(
+                    &agent,
+                    INTEGRATION_TASK_KEY,
+                    lease_seconds,
+                    Some("merging into the integration branch"),
+                )?;
+                let acquired = claimed["acquired"] == true;
+                emit(&claimed)?;
+                if !acquired {
+                    return Ok(1);
+                }
+            }
         }
         Commands::Doctor { workspace } => {
             let report = diagnose(&database, workspace.as_deref())?;

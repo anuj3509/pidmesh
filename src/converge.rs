@@ -201,6 +201,16 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
     })
 }
 
+/// Resolve the integration branch's current head commit.
+///
+/// Merge readiness compares this against the commit a worktree was cut from, so it has to be the
+/// branch tip rather than the merge base.
+pub fn integration_head(checkout: &Path, base_ref: Option<&str>) -> Result<(String, String)> {
+    let base_ref = resolve_base_ref(checkout, base_ref)?;
+    let head = git_text(checkout, &["rev-parse", &base_ref])?;
+    Ok((base_ref, head))
+}
+
 /// Pick the integration branch to measure against.
 fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> {
     if let Some(requested) = requested {

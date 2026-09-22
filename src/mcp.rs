@@ -11,8 +11,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::converge::scan_worktree;
-use crate::store::MeshStore;
+use crate::converge::{integration_head, scan_worktree};
+use crate::store::{INTEGRATION_TASK_KEY, MeshStore};
 
 #[derive(Clone)]
 pub struct PidMeshMcp {
@@ -57,6 +57,12 @@ struct InboxParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SyncParams {
+    /// Integration branch to measure against; defaults to main, then master.
+    base: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MergeableParams {
     /// Integration branch to measure against; defaults to main, then master.
     base: Option<String>,
 }
@@ -350,12 +356,47 @@ impl PidMeshMcp {
     fn release_footprint(&self) -> Result<CallToolResult, McpError> {
         tool_result(self.store.release_footprint(&self.agent_id))
     }
+
+    #[tool(
+        description = "Check whether this checkout can merge without breaking another agent's work"
+    )]
+    fn mergeable(
+        &self,
+        Parameters(parameters): Parameters<MergeableParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = checkout_directory()
+            .and_then(|directory| integration_head(&directory, parameters.base.as_deref()))
+            .and_then(|(_, head)| self.store.merge_readiness(&self.agent_id, &head));
+        tool_result(result)
+    }
+
+    #[tool(description = "Take the workspace-wide integration lease so merges do not race")]
+    fn acquire_integration_lease(
+        &self,
+        Parameters(parameters): Parameters<ClaimParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result(self.store.claim(
+            &self.agent_id,
+            INTEGRATION_TASK_KEY,
+            parameters.lease_seconds,
+            Some("merging into the integration branch"),
+        ))
+    }
+
+    #[tool(description = "Release the workspace-wide integration lease after merging")]
+    fn release_integration_lease(&self) -> Result<CallToolResult, McpError> {
+        tool_result(
+            self.store
+                .release(&self.agent_id, INTEGRATION_TASK_KEY)
+                .map(|released| json!({"released": released})),
+        )
+    }
 }
 
 #[tool_handler(
     name = "PidMesh",
     version = "1.5.0",
-    instructions = "Check status and inbox, claim a task, reserve intended paths before editing, and record decisions as memories. Call sync_footprint after each round of edits so other agents can see what this checkout actually changed, and read collisions before continuing work on a contested path."
+    instructions = "Check status and inbox, claim a task, reserve intended paths before editing, and record decisions as memories. Call sync_footprint after each round of edits so other agents can see what this checkout actually changed, and read collisions before continuing work on a contested path. Before merging, call mergeable and resolve every blocker, then hold the integration lease for the merge itself."
 )]
 impl ServerHandler for PidMeshMcp {}
 

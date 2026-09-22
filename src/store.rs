@@ -820,6 +820,107 @@ impl MeshStore {
         })
     }
 
+    /// Decide whether this agent can merge without breaking somebody else.
+    ///
+    /// Collision reporting says a conflict exists; this says what to do about it. The caller
+    /// supplies the integration branch's current head, because resolving it is a git question.
+    pub fn merge_readiness(&self, agent_id: &str, integration_head: &str) -> Result<Value> {
+        let now = now_ms()?;
+        self.read(|connection| {
+            let agent = Self::agent_row(connection, agent_id)?;
+            let base_commit: Option<String> = connection
+                .query_row(
+                    "SELECT base_commit FROM footprints
+                     WHERE workspace_id = ? AND agent_id = ? LIMIT 1",
+                    params![agent.workspace_id, agent_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            let mut blockers = Vec::new();
+
+            // A worktree cut from a commit the integration branch has moved past may still merge
+            // cleanly and be wrong, because it was written against code that no longer exists.
+            if let Some(base) = base_commit.as_deref()
+                && base != integration_head
+            {
+                blockers.push(json!({
+                    "code": "stale_base",
+                    "detail": "the integration branch has advanced since this worktree was cut; \
+                               rebase before merging",
+                    "base_commit": base,
+                    "integration_head": integration_head
+                }));
+            }
+
+            // Only live peers block a merge. A stopped agent's preserved worktree is still worth
+            // reporting as a collision, but it cannot be asked to rebase and must not deadlock
+            // the queue.
+            for (path, participants) in workspace_collisions(connection, &agent.workspace_id)? {
+                if !participants
+                    .iter()
+                    .any(|participant| participant.agent_id == agent_id)
+                {
+                    continue;
+                }
+                let severity = classify(&participants);
+                if severity == "identical" {
+                    continue;
+                }
+                let peers: Vec<Value> = participants
+                    .iter()
+                    .filter(|participant| {
+                        participant.agent_id != agent_id && participant.status == "running"
+                    })
+                    .map(|participant| {
+                        json!({"agent_id": participant.agent_id, "agent_name": participant.agent_name})
+                    })
+                    .collect();
+                if peers.is_empty() {
+                    continue;
+                }
+                blockers.push(json!({
+                    "code": "contested_path",
+                    "detail": "another live checkout holds different content on this path",
+                    "path": path,
+                    "severity": severity,
+                    "peers": peers
+                }));
+            }
+
+            // Whoever holds the lease is mid-merge; anyone else would be racing them.
+            let lease: Option<(String, i64)> = connection
+                .query_row(
+                    "SELECT agent_id, lease_expires_at FROM claims
+                     WHERE workspace_id = ? AND task_key = ? AND lease_expires_at > ?",
+                    params![agent.workspace_id, INTEGRATION_TASK_KEY, now],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let holder = lease.as_ref().map(|(holder, _)| holder.clone());
+            if let Some((holder, expires_at)) = lease.as_ref()
+                && holder != agent_id
+            {
+                blockers.push(json!({
+                    "code": "integration_held",
+                    "detail": "another agent holds the integration lease and is merging now",
+                    "held_by": holder,
+                    "lease_expires_at": expires_at
+                }));
+            }
+
+            Ok(json!({
+                "agent_id": agent_id,
+                "mergeable": blockers.is_empty(),
+                "base_commit": base_commit,
+                "integration_head": integration_head,
+                "holds_integration_lease": holder.as_deref() == Some(agent_id),
+                "blockers": blockers
+            }))
+        })
+    }
+
     /// Live agents in this workspace that have a recorded checkout.
     ///
     /// A supervisor uses this to observe a fleet that never calls `sync` itself: every checkout is
@@ -1784,6 +1885,13 @@ fn add_column_if_missing(
 }
 
 /// A live agent session and the checkout it is working in.
+/// Task key reserved for the workspace-wide integration lease.
+///
+/// Merges are serialized through the ordinary claim table rather than a new mechanism: it already
+/// guarantees exactly one owner until expiry, survives a crashed holder, and is released with the
+/// rest of an agent's state.
+pub const INTEGRATION_TASK_KEY: &str = "pidmesh:integration";
+
 #[derive(Clone, Debug)]
 pub struct AgentCheckout {
     pub agent_id: String,
