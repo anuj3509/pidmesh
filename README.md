@@ -156,6 +156,27 @@ Every collision also reports `base_divergent`. Two agents can edit different fil
 each other when one cuts its worktree from a base the other has already moved past, which is how a
 clean merge still produces broken behaviour.
 
+### Catch the conflict that shares no file
+
+Two agents can edit entirely different files and still break each other: one withdraws an exported
+name, the other writes code that calls it. Git merges both without complaint and the result does
+not build. No amount of path comparison can see this.
+
+A scan also records the exported names a checkout **withdrew** — declared on a removed line and
+never added back — and the identifiers its changed files reference. A withdrawn name that another
+live checkout still uses is reported as a symbol break and blocks the merge of whoever is removing
+it:
+
+```bash
+pidmesh collisions   # includes symbol_breaks alongside contested paths
+pidmesh mergeable    # blocks on removed_export_in_use
+```
+
+Export detection is a deliberately narrow heuristic covering the common declaration forms of Rust,
+TypeScript, JavaScript, Python and Go. It returns nothing when unsure, because a missed warning is
+cheaper than a false alarm, and a name that is deleted and re-added — an edited signature — is not
+a withdrawal.
+
 ### Gate the merge, not just the edit
 
 Collision reporting says a conflict exists. Merge ordering says what to do about it:
@@ -173,6 +194,7 @@ pidmesh integrate --release
 | `stale_base` | The integration branch advanced since this worktree was cut. The diff may still apply cleanly and be wrong, because it was written against code that no longer exists. Rebase. |
 | `contested_path` | Another **live** checkout rewrote an overlapping region of a path this one changed. Judged per pair, so the blocker names exactly which peers conflict. |
 | `integration_held` | Another agent holds the integration lease and is merging right now. |
+| `removed_export_in_use` | This checkout withdraws an exported name another live checkout still references. |
 
 Duplicated work never blocks: if two checkouts hold byte-identical content, merging either is safe.
 Neither do `adjacent` edits, which is what keeps a shared router or module index from blocking the
@@ -290,6 +312,7 @@ the server from the project directory. `PIDMESH_DB` overrides the default
 - Collision events fire on transitions only, so steady-state re-scanning is free.
 - A watcher can observe every checkout without any agent participating.
 - Edits to separable regions of one file are distinguished from edits that overwrite each other.
+- Withdrawing an export a live checkout still calls is caught even when no file is shared.
 - A stale base blocks a merge even when the diff would apply cleanly.
 - The integration lease admits one merge at a time and has exactly one owner until expiry.
 

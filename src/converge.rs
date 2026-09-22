@@ -5,7 +5,7 @@
 //! is pure git observation: it never mutates the checkout and never needs the agent's cooperation
 //! beyond being pointed at a directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -19,6 +19,15 @@ const DEFAULT_BASE_REFS: [&str; 2] = ["main", "master"];
 /// Files above this size are not fingerprinted; they are reported as divergent instead, which is
 /// the conservative direction.
 const MAX_HASHED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cap on identifiers recorded per checkout, so a generated file cannot flood the mesh.
+const MAX_REFERENCES: usize = 5_000;
+
+/// Words that look like identifiers but never name an export worth tracking.
+const REFERENCE_STOPLIST: [&str; 24] = [
+    "and", "ary", "class", "const", "def", "else", "enum", "export", "false", "fn", "for", "from",
+    "func", "if", "impl", "import", "let", "mut", "not", "pub", "return", "self", "true", "type",
+];
 
 /// How a path was changed inside a worktree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +85,19 @@ pub struct FootprintEntry {
     pub ranges: Option<String>,
 }
 
+/// Exported names a checkout withdrew, and names its changed files still lean on.
+///
+/// Path-level collisions cannot see the case where two agents edit *different* files and one
+/// removes or renames something the other calls. That merge is textually clean and behaviourally
+/// broken, which is the failure this closes.
+#[derive(Clone, Debug, Default)]
+pub struct SymbolFootprint {
+    /// `(symbol, path)` for each exported name this checkout deleted and did not add back.
+    pub removed_exports: Vec<(String, String)>,
+    /// Identifiers appearing in this checkout's changed files.
+    pub references: Vec<String>,
+}
+
 /// A complete observation of one checkout at a point in time.
 #[derive(Clone, Debug)]
 pub struct WorktreeScan {
@@ -83,6 +105,7 @@ pub struct WorktreeScan {
     pub base_commit: String,
     pub branch: Option<String>,
     pub entries: Vec<FootprintEntry>,
+    pub symbols: SymbolFootprint,
 }
 
 /// One agent's stake in a contested path.
@@ -216,9 +239,10 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         kinds.insert(path, kind);
     }
 
-    let mut regions = changed_regions(checkout, &base_commit).unwrap_or_default();
+    let (mut regions, removed_exports, _) =
+        changed_regions(checkout, &base_commit).unwrap_or_default();
 
-    let entries = kinds
+    let entries: Vec<FootprintEntry> = kinds
         .into_iter()
         .map(|(path, reported)| {
             // A lossily-decoded name does not address a real file, so trust neither the
@@ -248,11 +272,21 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
             }
         })
         .collect();
+    let live: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.change_kind != ChangeKind::Deleted)
+        .map(|entry| entry.path.clone())
+        .collect();
+    let symbols = SymbolFootprint {
+        removed_exports,
+        references: referenced_symbols(checkout, &live),
+    };
     Ok(WorktreeScan {
         base_ref,
         base_commit,
         branch,
         entries,
+        symbols,
     })
 }
 
@@ -348,7 +382,10 @@ fn uncommitted_changes(checkout: &Path) -> Result<Vec<(String, ChangeKind)>> {
 /// One `git diff` covers every tracked path, committed and uncommitted alike, because diffing a
 /// commit against the working tree already unions both. Untracked files have no base side and so
 /// appear here at all.
-fn changed_regions(checkout: &Path, base_commit: &str) -> Result<BTreeMap<String, String>> {
+/// Per-path base regions, exported names withdrawn, and exported names introduced.
+type DiffSummary = (BTreeMap<String, String>, Vec<(String, String)>, Vec<String>);
+
+fn changed_regions(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
     let raw = git_bytes(
         checkout,
         &[
@@ -363,21 +400,116 @@ fn changed_regions(checkout: &Path, base_commit: &str) -> Result<BTreeMap<String
     let text = String::from_utf8_lossy(&raw);
     let mut regions: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut current: Option<String> = None;
+    let mut removed: Vec<(String, String)> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("--- ") {
             // `--- a/path`, or `--- /dev/null` for an addition, which has no base side.
             current = rest.strip_prefix("a/").map(ToOwned::to_owned);
-        } else if let Some(rest) = line.strip_prefix("@@ ")
+        } else if let Some(rest) = line.strip_prefix("@@ ") {
+            if let Some(path) = current.as_ref()
+                && let Some(span) = base_span(rest)
+            {
+                regions.entry(path.clone()).or_default().push(span);
+            }
+        } else if let Some(rest) = line.strip_prefix('-')
+            && !rest.starts_with("--")
             && let Some(path) = current.as_ref()
-            && let Some(span) = base_span(rest)
+            && let Some(symbol) = exported_name(rest)
         {
-            regions.entry(path.clone()).or_default().push(span);
+            removed.push((symbol, path.clone()));
+        } else if let Some(rest) = line.strip_prefix('+')
+            && !rest.starts_with("++")
+            && let Some(symbol) = exported_name(rest)
+        {
+            added.push(symbol);
         }
     }
-    Ok(regions
+    // A rewritten signature reads as a delete plus an add. Only a name that never comes back was
+    // genuinely withdrawn.
+    removed.retain(|(symbol, _)| !added.contains(symbol));
+    let regions = regions
         .into_iter()
         .map(|(path, spans)| (path, spans.join(",")))
-        .collect())
+        .collect();
+    Ok((regions, removed, added))
+}
+
+/// The exported name a source line declares, if it declares one.
+///
+/// Heuristic and deliberately narrow: it recognises the common export forms of Rust, TypeScript,
+/// JavaScript, Python and Go, and returns nothing when unsure. A missed export costs a warning
+/// that is not raised; a wrong one costs a false alarm, which is worse.
+#[must_use]
+fn exported_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = [
+        "pub fn ",
+        "pub struct ",
+        "pub enum ",
+        "pub trait ",
+        "pub const ",
+        "pub type ",
+        "pub static ",
+        "pub async fn ",
+        "export function ",
+        "export async function ",
+        "export const ",
+        "export class ",
+        "export interface ",
+        "export type ",
+        "export enum ",
+        "export default function ",
+        "def ",
+        "class ",
+        "func ",
+        "type ",
+    ]
+    .into_iter()
+    .find_map(|prefix| trimmed.strip_prefix(prefix))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    // Go exports by capitalisation; `func main` and lowercase helpers are not API.
+    if name.len() < 2 || name.starts_with(char::is_numeric) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Identifiers appearing in a checkout's changed files.
+fn referenced_symbols(checkout: &Path, paths: &[String]) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for path in paths {
+        let Ok(content) = fs::read_to_string(checkout.join(path)) else {
+            continue;
+        };
+        let mut word = String::new();
+        for character in content.chars() {
+            if character.is_alphanumeric() || character == '_' {
+                word.push(character);
+                continue;
+            }
+            take_word(&mut word, &mut seen);
+            if seen.len() >= MAX_REFERENCES {
+                return seen.into_iter().collect();
+            }
+        }
+        take_word(&mut word, &mut seen);
+    }
+    seen.into_iter().collect()
+}
+
+fn take_word(word: &mut String, seen: &mut BTreeSet<String>) {
+    if word.len() >= 3
+        && !word.starts_with(char::is_numeric)
+        && !REFERENCE_STOPLIST.contains(&word.as_str())
+    {
+        seen.insert(std::mem::take(word));
+    } else {
+        word.clear();
+    }
 }
 
 /// Turn the `-start,count` half of a hunk header into an inclusive `start-end` span.

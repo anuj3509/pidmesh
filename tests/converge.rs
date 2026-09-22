@@ -1306,3 +1306,118 @@ fn one_overlapping_pair_does_not_block_everyone_on_a_shared_file() -> Result<()>
     assert_eq!(peers[0]["severity"], "divergent");
     Ok(())
 }
+
+/// The conflict path-level comparison structurally cannot see.
+///
+/// Two agents edit entirely different files. One withdraws an exported function; the other writes
+/// new code that calls it. Git merges both without complaint and the result does not build.
+#[test]
+fn removing_an_export_another_checkout_calls_is_caught() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn compute_total() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(fleet.repository.join("src/caller.rs"), "fn unused() {}\n")?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // alpha retires the export, touching only src/api.rs.
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+    )?;
+    // bravo writes a new caller, touching only src/caller.rs.
+    std::fs::write(
+        bravo_tree.join("src/caller.rs"),
+        "fn report() -> u32 {\n    compute_total()\n}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    // No path is shared, so path-level detection sees nothing at all.
+    assert!(
+        fleet.collisions(&alpha)?.is_empty(),
+        "the two checkouts share no path"
+    );
+
+    let report = fleet.store.collisions(&alpha)?;
+    let breaks = report["symbol_breaks"].as_array().context("breaks")?;
+    assert_eq!(breaks.len(), 1, "{report}");
+    assert_eq!(breaks[0]["symbol"], "compute_total");
+    assert_eq!(breaks[0]["removed_from"], "src/api.rs");
+    assert_eq!(breaks[0]["used_by"]["agent_name"], "bravo");
+
+    // And it must block alpha's merge, since alpha is the one breaking bravo.
+    let alpha_readiness = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(alpha_readiness["mergeable"], false, "{alpha_readiness}");
+    assert!(
+        blocker_codes(&alpha_readiness).contains(&"removed_export_in_use".to_owned()),
+        "{alpha_readiness}"
+    );
+    // bravo is not the one removing anything, so bravo is free to land.
+    assert_eq!(readiness(&fleet, &bravo, &bravo_tree)?["mergeable"], true);
+    Ok(())
+}
+
+#[test]
+fn a_renamed_export_that_is_added_back_is_not_a_break() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn compute_total() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(fleet.repository.join("src/caller.rs"), "fn unused() {}\n")?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Reformatting the signature deletes and re-adds the same name; nothing was withdrawn.
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn compute_total(scale: u32) -> u32 {\n    7 * scale\n}\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/caller.rs"),
+        "fn report() -> u32 {\n    compute_total()\n}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = fleet.store.collisions(&alpha)?;
+    assert_eq!(
+        report["symbol_break_count"], 0,
+        "the name still exists: {report}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_withdrawn_export_nobody_uses_does_not_block() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn never_called() -> u32 {\n    7\n}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn kept() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(bravo_tree.join("src/only-bravo.rs"), "fn other() {}\n")?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    assert_eq!(fleet.store.collisions(&alpha)?["symbol_break_count"], 0);
+    assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
+    Ok(())
+}

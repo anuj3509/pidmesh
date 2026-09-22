@@ -130,6 +130,28 @@ agents launched by an arbitrary harness. A sweep scans each distinct checkout on
 how many sessions occupy it, skips checkouts that have been removed, and ignores sessions whose
 process is gone.
 
+## Symbol footprints
+
+Paths answer who is touching what. They cannot answer whether two agents working on different
+files have broken each other, which happens when one withdraws an exported name the other calls:
+the merge is textually clean and the result does not build.
+
+A scan therefore also records two sets per checkout. The withdrawn set holds exported names
+declared on a line the diff removed and not reintroduced on a line it added, so an edited
+signature — deleted and re-added under the same name — is not a withdrawal. The reference set
+holds identifiers appearing in the checkout's changed files, capped so a generated file cannot
+flood the mesh, and filtered by a short stoplist of language keywords.
+
+Recognising an export is a heuristic covering the common declaration forms of Rust, TypeScript,
+JavaScript, Python and Go. It yields nothing when unsure. The asymmetry is deliberate: a missed
+warning costs an unreported break, while a wrong one costs a false alarm against work that was
+fine, and false alarms are what teach an operator to stop reading the output.
+
+A withdrawn name that another checkout references is a symbol break. It is attributed to the
+checkout doing the removing rather than the one doing the calling, because that is the side whose
+merge introduces the failure, and it is matched across checkouts rather than agents so two
+sessions in one worktree never break each other.
+
 ## Merge ordering
 
 A collision report states that two checkouts disagree. Merge readiness decides whether one of them

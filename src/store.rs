@@ -156,6 +156,18 @@ ON footprints(workspace_id, path);
 
 CREATE INDEX IF NOT EXISTS footprints_agent
 ON footprints(workspace_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS symbol_footprints (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    path TEXT,
+    PRIMARY KEY (workspace_id, agent_id, kind, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS symbol_footprints_lookup
+ON symbol_footprints(workspace_id, kind, symbol);
 ";
 
 #[derive(Clone, Debug)]
@@ -804,6 +816,10 @@ impl MeshStore {
                 "DELETE FROM footprints WHERE workspace_id = ? AND agent_id = ?",
                 params![agent.workspace_id, agent_id],
             )?;
+            transaction.execute(
+                "DELETE FROM symbol_footprints WHERE workspace_id = ? AND agent_id = ?",
+                params![agent.workspace_id, agent_id],
+            )?;
             let after = collision_signatures(transaction, &agent.workspace_id)?;
             for path in before.keys() {
                 if !after.contains_key(path) {
@@ -902,6 +918,8 @@ impl MeshStore {
                     "peers": peers
                 }));
             }
+
+            blockers.extend(symbol_blockers(connection, &agent.workspace_id, agent_id)?);
 
             // Whoever holds the lease is mid-merge; anyone else would be racing them.
             let lease: Option<(String, i64)> = connection
@@ -1008,6 +1026,27 @@ impl MeshStore {
                     ],
                 )?;
             }
+            transaction.execute(
+                "DELETE FROM symbol_footprints WHERE workspace_id = ? AND agent_id = ?",
+                params![agent.workspace_id, agent_id],
+            )?;
+            for (symbol, path) in &scan.symbols.removed_exports {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO symbol_footprints(
+                        workspace_id, agent_id, kind, symbol, path
+                     ) VALUES (?, ?, 'removed_export', ?, ?)",
+                    params![agent.workspace_id, agent_id, symbol, path],
+                )?;
+            }
+            for symbol in &scan.symbols.references {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO symbol_footprints(
+                        workspace_id, agent_id, kind, symbol, path
+                     ) VALUES (?, ?, 'reference', ?, NULL)",
+                    params![agent.workspace_id, agent_id, symbol],
+                )?;
+            }
+
             let contested = workspace_collisions(transaction, &agent.workspace_id)?;
             let after = signatures_of(&contested);
 
@@ -1068,10 +1107,13 @@ impl MeshStore {
         self.read(|connection| {
             let agent = Self::agent_row(connection, agent_id)?;
             let contested = workspace_collisions(connection, &agent.workspace_id)?;
+            let breaks = workspace_symbol_breaks(connection, &agent.workspace_id)?;
             Ok(json!({
                 "agent_id": agent_id,
                 "collisions": collision_report(&contested, agent_id),
-                "collision_count": contested.len()
+                "collision_count": contested.len(),
+                "symbol_breaks": symbol_break_report(&breaks, agent_id),
+                "symbol_break_count": breaks.len()
             }))
         })
     }
@@ -1366,6 +1408,10 @@ impl MeshStore {
                 for agent_id in &agent_ids {
                     abandoned_footprints += transaction
                         .execute("DELETE FROM footprints WHERE agent_id = ?", [agent_id])?;
+                    transaction.execute(
+                        "DELETE FROM symbol_footprints WHERE agent_id = ?",
+                        [agent_id],
+                    )?;
                 }
                 let after = collision_signatures(transaction, &workspace_id)?;
                 for path in before.keys() {
@@ -1406,7 +1452,7 @@ impl MeshStore {
                     add_column_if_missing(&connection, "agents", "checkout_path", "TEXT")?;
                     add_column_if_missing(&connection, "agents", "git_branch", "TEXT")?;
                     add_column_if_missing(&connection, "footprints", "ranges", "TEXT")?;
-                    connection.pragma_update(None, "user_version", 4)?;
+                    connection.pragma_update(None, "user_version", 5)?;
                     return Ok(());
                 }
                 Err(error) if is_busy(&error) && attempt < 7 => {
@@ -1977,6 +2023,50 @@ fn workspace_collisions(
     Ok(grouped)
 }
 
+/// One export withdrawn by a checkout that another checkout still references.
+struct SymbolBreak {
+    symbol: String,
+    removed_from: String,
+    removed_by: String,
+    used_by: String,
+    used_by_name: String,
+}
+
+/// Exported names one checkout withdrew that another checkout's changed files still use.
+///
+/// This is the conflict path-level comparison cannot see: two agents edit different files, one
+/// removes or renames an export, and the merge is textually clean but behaviourally broken.
+fn workspace_symbol_breaks(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<Vec<SymbolBreak>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT r.symbol, r.path, r.agent_id, u.agent_id, a.name
+         FROM symbol_footprints r
+         JOIN symbol_footprints u
+           ON u.workspace_id = r.workspace_id AND u.symbol = r.symbol AND u.kind = 'reference'
+         JOIN agents ra ON ra.id = r.agent_id
+         JOIN agents a ON a.id = u.agent_id
+         WHERE r.workspace_id = ?1
+           AND r.kind = 'removed_export'
+           AND r.agent_id != u.agent_id
+           AND COALESCE(ra.checkout_path, r.agent_id) != COALESCE(a.checkout_path, u.agent_id)
+         ORDER BY r.symbol, u.agent_id",
+    )?;
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok(SymbolBreak {
+                symbol: row.get(0)?,
+                removed_from: row.get(1)?,
+                removed_by: row.get(2)?,
+                used_by: row.get(3)?,
+                used_by_name: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// A stable fingerprint of one collision, used to emit events only on real transitions.
 fn signatures_of(contested: &[(String, Vec<Participant>)]) -> BTreeMap<String, String> {
     contested
@@ -2003,6 +2093,60 @@ fn collision_signatures(
         connection,
         workspace_id,
     )?))
+}
+
+/// Blockers for exports this agent withdraws that a live peer still references.
+///
+/// Removing a name another checkout calls produces a textually clean merge and a broken build,
+/// which is the one failure path-level comparison cannot reach.
+fn symbol_blockers(
+    connection: &Connection,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Result<Vec<Value>> {
+    let mut blockers = Vec::new();
+    for entry in workspace_symbol_breaks(connection, workspace_id)? {
+        if entry.removed_by != agent_id {
+            continue;
+        }
+        let live: bool = connection
+            .query_row(
+                "SELECT status = 'running' FROM agents WHERE id = ?",
+                [&entry.used_by],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !live {
+            continue;
+        }
+        blockers.push(json!({
+            "code": "removed_export_in_use",
+            "detail": "this checkout withdraws an exported name another live checkout still \
+                       references; the merge would be clean and broken",
+            "symbol": entry.symbol,
+            "path": entry.removed_from,
+            "used_by": {"agent_id": entry.used_by, "agent_name": entry.used_by_name}
+        }));
+    }
+    Ok(blockers)
+}
+
+fn symbol_break_report(breaks: &[SymbolBreak], viewer: &str) -> Value {
+    Value::Array(
+        breaks
+            .iter()
+            .map(|entry| {
+                json!({
+                    "symbol": entry.symbol,
+                    "removed_from": entry.removed_from,
+                    "removed_by": entry.removed_by,
+                    "used_by": {"agent_id": entry.used_by, "agent_name": entry.used_by_name},
+                    "involves_me": entry.removed_by == viewer || entry.used_by == viewer
+                })
+            })
+            .collect::<Vec<Value>>(),
+    )
 }
 
 fn collision_report(contested: &[(String, Vec<Participant>)], viewer: &str) -> Value {
