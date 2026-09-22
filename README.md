@@ -126,6 +126,46 @@ pidmesh gc
 
 Every command emits JSON for reliable agent consumption.
 
+## Detect collisions nobody declared
+
+Resource reservations describe what an agent *intends* to touch. They only work when every agent
+remembers to call `reserve` before editing, and they cannot see the scope an agent discovered
+halfway through its task. The convergence guard closes that gap by observing what each checkout
+**actually** changed:
+
+```bash
+pidmesh sync          # observe this worktree and publish its footprint
+pidmesh collisions    # every path contested by more than one agent
+```
+
+`sync` is pure observation. It never writes to the checkout, needs no cooperation beyond being
+pointed at a directory, and counts both committed and uncommitted work, including untracked files.
+A footprint is authoritative per agent, so an agent that merges and cleans its worktree drops out of
+every collision on its next scan.
+
+Each contested path is classified by what would actually happen on merge:
+
+| Severity | Meaning |
+| --- | --- |
+| `identical` | Several agents produced byte-identical content: duplicated effort, safe to merge. |
+| `divergent` | The same path holds different content in different checkouts. This is the case that silently overwrites work. |
+| `delete_edit` | One agent removed a path another is still editing. Git merges this without complaint in several common orderings. |
+
+Every collision also reports `base_divergent`. Two agents can edit different files and still break
+each other when one cuts its worktree from a base the other has already moved past, which is how a
+clean merge still produces broken behaviour.
+
+Detection is a mesh event, not a return value. A new or changed collision appends
+`collision.detected`, and withdrawing from a contested path appends `collision.cleared`, so peers
+already parked on `pidmesh wait` wake the moment an overlap appears:
+
+```bash
+pidmesh wait --agent "$PIDMESH_AGENT_ID" --after 0 --timeout-seconds 30
+```
+
+Events fire only on transitions. A fleet that re-scans on a loop produces no event churn while
+nothing changes.
+
 ## Run a native agent swarm
 
 Launch five independently addressable agent processes with one supervisor:
@@ -148,8 +188,9 @@ agent's actual checkout path and branch, so a fleet launched by Superset, Intent
 
 ## MCP setup
 
-The native MCP server uses the official Rust SDK and exposes eleven tools: status, remember, recall,
-send, inbox, claim, release, resource reservation/release, event stream, and bounded event waiting.
+The native MCP server uses the official Rust SDK and exposes thirteen tools: status, remember, recall,
+send, inbox, claim, release, resource reservation/release, event stream, bounded event waiting,
+footprint sync, and collision reporting.
 
 Claude Code:
 
@@ -183,6 +224,8 @@ the server from the project directory. `PIDMESH_DB` overrides the default
 - Broadcast acknowledgements are independent for every agent.
 - Linked git worktrees share one logical project while unrelated workspaces remain isolated.
 - Bounded waits wake agents without a tight polling loop.
+- Observed footprints detect overlapping edits that no agent reserved.
+- Collision events fire on transitions only, so steady-state re-scanning is free.
 
 The test suite launches eight separate processes to verify write integrity and prove that task and
 overlapping-path contention each have exactly one winner. It also tests linked worktree discovery,

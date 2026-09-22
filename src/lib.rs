@@ -1,3 +1,4 @@
+pub mod converge;
 pub mod dashboard;
 pub mod ide;
 pub mod mcp;

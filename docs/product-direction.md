@@ -39,6 +39,7 @@ Its workspace now owns the thin end-to-end operator loop: create a scoped task, 
 5. **Local by default.** Operational data and controls remain on loopback and never require a cloud account.
 6. **Observable decisions.** Ownership, contention, messages, and memory changes produce an ordered event trail.
 7. **One operator workspace.** Launch, terminal, files, diffs, attention, approvals, and fleet state belong in one interface.
+8. **Observation over declaration.** Any coordination that depends on an agent remembering to declare something must be backed by a check that observes what actually happened.
 
 ## Version 1.3: Worktree-aware collision guard
 
@@ -73,6 +74,34 @@ The dashboard accepts task, prompt, provider ID, and relative scopes. It never a
 
 Path scope is currently a merge-gate invariant, not a filesystem sandbox. Agents work inside an isolated git checkout, but a tool capable of accessing absolute paths can still reach the wider host. PidMesh identifies and blocks out-of-scope repository changes before approval; stronger operating-system containment remains future work.
 
+## Version 1.5: Observed convergence
+
+Versions 1.3 and 1.4 made collision prevention *declarative*: an agent reserves a path, and the
+merge gate checks one managed run against the scopes it declared. Both depend on the agent
+declaring correctly and in advance. Neither can see an overlap between two checkouts that nobody
+reserved, and neither applies to agents launched outside the dashboard, which the "any harness"
+principle says will be most of them.
+
+The convergence guard makes collision detection *observational*:
+
+- per-agent worktree footprints derived from git, covering committed and uncommitted work;
+- content hashing, so duplicated effort is distinguishable from divergent edits;
+- cross-checkout collision detection that requires no reservation and no agent cooperation;
+- merge-outcome severity (`identical`, `divergent`, `delete_edit`) rather than lock ownership;
+- base-commit divergence reporting, which catches the stale worktree whose diff merges cleanly and
+  still breaks behaviour;
+- transition-only `collision.detected` and `collision.cleared` events, so a fleet parked on
+  `wait` is woken by real overlaps and never by polling;
+- CLI and MCP surfaces, so any harness participates.
+
+This is the first capability in PidMesh that does not require an agent to declare anything. It
+complements reservations rather than replacing them: a reservation still prevents a collision, while
+a footprint reports the one that happened anyway.
+
+Footprints describe paths. Two agents editing different files can still break each other by changing
+a shared interface, and detecting that requires reading symbols rather than path names. That remains
+future work.
+
 ## Workspace information architecture
 
 The local workspace answers five questions in order:
@@ -85,16 +114,16 @@ The local workspace answers five questions in order:
 
 The Workspace view is the default task flow. Operations remains available as the fleet-level diagnostic view.
 
-## Roadmap after 1.4
+## Roadmap after 1.5
 
-### 1.5: Durable runs and causal handoffs
+### 1.6: Durable runs and causal handoffs
 
 - Persistent run metadata and optional local terminal transcripts across dashboard restarts.
 - Structured handoff bundles linking task, resources, memories, messages, branch, and verification evidence.
 - Attention states such as blocked, review requested, and human decision required.
 - Event replay that shows what an agent knew when it made a decision.
 
-### 1.6: Resource-aware scheduler
+### 1.7: Resource-aware scheduler
 
 - CPU, memory, GPU, and token-budget admission control.
 - Queueing and backpressure instead of blindly starting more agents.

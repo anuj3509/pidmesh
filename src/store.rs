@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use crate::converge::{Participant, WorktreeScan, base_divergent, classify};
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -135,6 +137,24 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS events_workspace_sequence
 ON events(workspace_id, sequence DESC);
+
+CREATE TABLE IF NOT EXISTS footprints (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    change_kind TEXT NOT NULL,
+    digest TEXT,
+    base_commit TEXT,
+    branch TEXT,
+    observed_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, agent_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS footprints_workspace_path
+ON footprints(workspace_id, path);
+
+CREATE INDEX IF NOT EXISTS footprints_agent
+ON footprints(workspace_id, agent_id);
 ";
 
 #[derive(Clone, Debug)]
@@ -771,6 +791,105 @@ impl MeshStore {
         })
     }
 
+    /// Replace this agent's observed footprint and report the collisions that result.
+    ///
+    /// The footprint is authoritative per agent: a scan that no longer touches a path releases it,
+    /// so an agent that merges and cleans its worktree drops out of every collision automatically.
+    pub fn publish_footprint(&self, agent_id: &str, scan: &WorktreeScan) -> Result<Value> {
+        let now = now_ms()?;
+        self.write(|transaction| {
+            let agent = Self::agent_row(transaction, agent_id)?;
+            let before = collision_signatures(transaction, &agent.workspace_id)?;
+            transaction.execute(
+                "DELETE FROM footprints WHERE workspace_id = ? AND agent_id = ?",
+                params![agent.workspace_id, agent_id],
+            )?;
+            for entry in &scan.entries {
+                transaction.execute(
+                    "INSERT INTO footprints(
+                        workspace_id, agent_id, path, change_kind, digest,
+                        base_commit, branch, observed_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        agent.workspace_id,
+                        agent_id,
+                        entry.path,
+                        entry.change_kind.as_str(),
+                        entry.digest,
+                        scan.base_commit,
+                        scan.branch,
+                        now
+                    ],
+                )?;
+            }
+            let contested = workspace_collisions(transaction, &agent.workspace_id)?;
+            let after = signatures_of(&contested);
+
+            // Emitting only on transitions keeps `pidmesh wait` from spinning while a fleet
+            // re-scans, while still waking every peer the moment a real overlap appears.
+            for (path, signature) in &after {
+                if before.get(path) != Some(signature) {
+                    Self::event(
+                        transaction,
+                        &agent.workspace_id,
+                        Some(agent_id),
+                        "collision.detected",
+                        Some(path),
+                        &json!({"signature": signature}),
+                    )?;
+                }
+            }
+            for path in before.keys() {
+                if !after.contains_key(path) {
+                    Self::event(
+                        transaction,
+                        &agent.workspace_id,
+                        Some(agent_id),
+                        "collision.cleared",
+                        Some(path),
+                        &json!({}),
+                    )?;
+                }
+            }
+
+            Self::event(
+                transaction,
+                &agent.workspace_id,
+                Some(agent_id),
+                "footprint.published",
+                scan.branch.as_deref(),
+                &json!({
+                    "paths": scan.entries.len(),
+                    "base_ref": scan.base_ref,
+                    "base_commit": scan.base_commit
+                }),
+            )?;
+
+            Ok(json!({
+                "agent_id": agent_id,
+                "base_ref": scan.base_ref,
+                "base_commit": scan.base_commit,
+                "branch": scan.branch,
+                "paths": scan.entries.len(),
+                "collisions": collision_report(&contested, agent_id),
+                "collision_count": contested.len()
+            }))
+        })
+    }
+
+    /// Report every contested path in the workspace without changing any footprint.
+    pub fn collisions(&self, agent_id: &str) -> Result<Value> {
+        self.read(|connection| {
+            let agent = Self::agent_row(connection, agent_id)?;
+            let contested = workspace_collisions(connection, &agent.workspace_id)?;
+            Ok(json!({
+                "agent_id": agent_id,
+                "collisions": collision_report(&contested, agent_id),
+                "collision_count": contested.len()
+            }))
+        })
+    }
+
     pub fn status(&self, agent_id: Option<&str>, root: Option<&Path>) -> Result<Value> {
         self.read(|connection| {
             let workspace = if let Some(agent_id) = agent_id {
@@ -1045,7 +1164,7 @@ impl MeshStore {
                 Ok(()) => {
                     add_column_if_missing(&connection, "agents", "checkout_path", "TEXT")?;
                     add_column_if_missing(&connection, "agents", "git_branch", "TEXT")?;
-                    connection.pragma_update(None, "user_version", 2)?;
+                    connection.pragma_update(None, "user_version", 3)?;
                     return Ok(());
                 }
                 Err(error) if is_busy(&error) && attempt < 7 => {
@@ -1462,6 +1581,111 @@ fn add_column_if_missing(
         ))?;
     }
     Ok(())
+}
+
+/// Every path in the workspace changed in more than one checkout.
+///
+/// Contention is keyed on checkout rather than agent: a worker that runs both a CLI session and an
+/// MCP session in one worktree is one editor of that path, not two.
+fn workspace_collisions(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<Vec<(String, Vec<Participant>)>> {
+    let mut statement = connection.prepare(
+        "SELECT f.path, f.agent_id, a.name, a.status, f.change_kind,
+                f.digest, f.base_commit, f.branch
+         FROM footprints f
+         JOIN agents a ON a.id = f.agent_id
+         WHERE f.workspace_id = ?1
+           AND f.path IN (
+               SELECT f2.path FROM footprints f2
+               JOIN agents a2 ON a2.id = f2.agent_id
+               WHERE f2.workspace_id = ?1
+               GROUP BY f2.path
+               HAVING COUNT(DISTINCT COALESCE(a2.checkout_path, f2.agent_id)) > 1
+           )
+         ORDER BY f.path, f.agent_id",
+    )?;
+    let rows = statement.query_map(params![workspace_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            Participant {
+                agent_id: row.get(1)?,
+                agent_name: row.get(2)?,
+                status: row.get(3)?,
+                change_kind: row.get(4)?,
+                digest: row.get(5)?,
+                base_commit: row.get(6)?,
+                branch: row.get(7)?,
+            },
+        ))
+    })?;
+    let mut grouped: Vec<(String, Vec<Participant>)> = Vec::new();
+    for row in rows {
+        let (path, participant) = row?;
+        match grouped.last_mut() {
+            Some((last, participants)) if *last == path => participants.push(participant),
+            _ => grouped.push((path, vec![participant])),
+        }
+    }
+    Ok(grouped)
+}
+
+/// A stable fingerprint of one collision, used to emit events only on real transitions.
+fn signatures_of(contested: &[(String, Vec<Participant>)]) -> BTreeMap<String, String> {
+    contested
+        .iter()
+        .map(|(path, participants)| {
+            let mut agents: Vec<&str> = participants
+                .iter()
+                .map(|participant| participant.agent_id.as_str())
+                .collect();
+            agents.sort_unstable();
+            (
+                path.clone(),
+                format!("{}|{}", classify(participants), agents.join(",")),
+            )
+        })
+        .collect()
+}
+
+fn collision_signatures(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    Ok(signatures_of(&workspace_collisions(
+        connection,
+        workspace_id,
+    )?))
+}
+
+fn collision_report(contested: &[(String, Vec<Participant>)], viewer: &str) -> Value {
+    let entries: Vec<Value> = contested
+        .iter()
+        .map(|(path, participants)| {
+            json!({
+                "path": path,
+                "severity": classify(participants),
+                "base_divergent": base_divergent(participants),
+                "involves_me": participants
+                    .iter()
+                    .any(|participant| participant.agent_id == viewer),
+                "participants": participants
+                    .iter()
+                    .map(|participant| json!({
+                        "agent_id": participant.agent_id,
+                        "agent_name": participant.agent_name,
+                        "status": participant.status,
+                        "change_kind": participant.change_kind,
+                        "digest": participant.digest,
+                        "base_commit": participant.base_commit,
+                        "branch": participant.branch
+                    }))
+                    .collect::<Vec<Value>>()
+            })
+        })
+        .collect();
+    Value::Array(entries)
 }
 
 fn dashboard_activity(
