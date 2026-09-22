@@ -345,6 +345,11 @@ impl PidMeshMcp {
     fn collisions(&self) -> Result<CallToolResult, McpError> {
         tool_result(self.store.collisions(&self.agent_id))
     }
+
+    #[tool(description = "Withdraw this agent's footprint when its work is merged or abandoned")]
+    fn release_footprint(&self) -> Result<CallToolResult, McpError> {
+        tool_result(self.store.release_footprint(&self.agent_id))
+    }
 }
 
 #[tool_handler(

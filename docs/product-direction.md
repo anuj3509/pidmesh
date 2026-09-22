@@ -99,6 +99,11 @@ This is the first capability in PidMesh that does not require an agent to declar
 complements reservations rather than replacing them: a reservation still prevents a collision, while
 a footprint reports the one that happened anyway.
 
+A footprint still had to be published by somebody, so the release also adds a watcher: because
+every checkout is recorded at registration, one supervisor observes the whole fleet and no agent
+has to participate at all. That is the difference that makes the guard hold for agents launched by
+Superset, Intent, Orca, or a bare terminal, none of which will call a PidMesh protocol unprompted.
+
 Footprints describe paths. Two agents editing different files can still break each other by changing
 a shared interface, and detecting that requires reading symbols rather than path names. That remains
 future work.

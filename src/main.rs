@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,7 @@ use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use pidmesh::converge::scan_worktree;
-use pidmesh::store::{MeshStore, default_database_path, workspace_root};
+use pidmesh::store::{AgentCheckout, MeshStore, default_database_path, diagnose, workspace_root};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -139,6 +140,29 @@ enum Commands {
     Collisions {
         #[arg(long)]
         agent: Option<String>,
+    },
+    /// Check that this workspace is actually one shared mesh.
+    Doctor {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Withdraw this agent's footprint from the mesh.
+    Unsync {
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Observe every live checkout in this workspace on an interval.
+    Watch {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Integration branch to measure against; defaults to main, then master.
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long, default_value_t = 5.0)]
+        interval_seconds: f64,
+        /// Run a single pass and exit.
+        #[arg(long)]
+        once: bool,
     },
     Status {
         #[arg(long)]
@@ -348,6 +372,29 @@ fn run() -> Result<u8> {
         Commands::Collisions { agent } => {
             emit(&store.collisions(&agent_id(agent.as_deref())?)?)?;
         }
+        Commands::Doctor { workspace } => {
+            let report = diagnose(&database, workspace.as_deref())?;
+            let healthy = report["healthy"] == true;
+            emit(&report)?;
+            if !healthy {
+                return Ok(1);
+            }
+        }
+        Commands::Unsync { agent } => {
+            emit(&store.release_footprint(&agent_id(agent.as_deref())?)?)?;
+        }
+        Commands::Watch {
+            workspace,
+            base,
+            interval_seconds,
+            once,
+        } => watch(
+            &store,
+            workspace.as_deref(),
+            base.as_deref(),
+            duration_from_seconds(interval_seconds)?,
+            once,
+        )?,
         Commands::Status { agent, workspace } => {
             emit(&store.status(agent.as_deref(), workspace.as_deref())?)?;
         }
@@ -712,6 +759,83 @@ fn run_supervised(
         .map_err(|_| anyhow!("heartbeat thread panicked"))?;
     store.stop_agent(&agent_id)?;
     Ok(status.code().unwrap_or(1).try_into().unwrap_or(1))
+}
+
+/// Observe every live checkout in a workspace and publish footprints on the fleet's behalf.
+///
+/// This is what makes convergence autonomic. `pidmesh sync` still has to be invoked by somebody,
+/// so a fleet whose agents never call it stays invisible to each other. A watcher needs no
+/// cooperation at all: registration already recorded every checkout.
+fn watch(
+    store: &MeshStore,
+    workspace: Option<&Path>,
+    base: Option<&str>,
+    interval: Duration,
+    once: bool,
+) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let signal_running = Arc::clone(&running);
+    ctrlc::set_handler(move || signal_running.store(false, Ordering::Relaxed))
+        .context("failed to install interrupt handler")?;
+    loop {
+        emit(&watch_pass(store, workspace, base)?)?;
+        if once {
+            break;
+        }
+        // Sleep in slices so an interrupt is observed promptly rather than at the next tick.
+        let deadline = Instant::now() + interval;
+        while running.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100).min(interval));
+        }
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// One observation sweep over every distinct live checkout.
+fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -> Result<Value> {
+    // Several sessions can share one checkout, so scan each checkout once and reuse the result.
+    let mut grouped: BTreeMap<PathBuf, Vec<AgentCheckout>> = BTreeMap::new();
+    for checkout in store.live_checkouts(workspace)? {
+        grouped
+            .entry(checkout.checkout_path.clone())
+            .or_default()
+            .push(checkout);
+    }
+    let mut published = 0usize;
+    let mut skipped = Vec::new();
+    let mut witness = None;
+    for (path, agents) in &grouped {
+        let scan = match scan_worktree(path, base) {
+            Ok(scan) => scan,
+            Err(error) => {
+                // A checkout can be removed or rewritten underneath us; that is not fatal.
+                skipped.push(json!({
+                    "checkout": path.to_string_lossy(),
+                    "error": format!("{error:#}")
+                }));
+                continue;
+            }
+        };
+        for agent in agents {
+            store.publish_footprint(&agent.agent_id, &scan)?;
+            witness.get_or_insert_with(|| agent.agent_id.clone());
+            published += 1;
+        }
+    }
+    let collisions = match witness {
+        Some(agent_id) => store.collisions(&agent_id)?,
+        None => json!({"collisions": [], "collision_count": 0}),
+    };
+    Ok(json!({
+        "checkouts": grouped.len(),
+        "published": published,
+        "skipped": skipped,
+        "collision_count": collisions["collision_count"],
+        "collisions": collisions["collisions"]
+    }))
 }
 
 fn agent_id(explicit: Option<&str>) -> Result<String> {

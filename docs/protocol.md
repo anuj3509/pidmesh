@@ -108,7 +108,17 @@ immediately on a real overlap.
 
 Footprints survive an agent being marked stopped, because PidMesh deliberately preserves worktrees
 and their uncommitted work. Collision reports carry each participant's session status so a reader
-can tell live contention from abandoned contention.
+can tell live contention from abandoned contention. Garbage collection removes a dead agent's
+footprint only once its checkout no longer exists on disk, at which point the contention it
+described cannot be real. An agent may also withdraw its footprint explicitly, which is the only
+option available to a session that is shutting down and can no longer produce a scan.
+
+Because every checkout is recorded at registration, a supervisor can publish footprints on behalf
+of a fleet that never calls the protocol itself. Observation therefore requires no agent
+participation at all, unlike a reservation, which is the property that makes convergence hold for
+agents launched by an arbitrary harness. A sweep scans each distinct checkout once regardless of
+how many sessions occupy it, skips checkouts that have been removed, and ignores sessions whose
+process is gone.
 
 ## Event stream
 

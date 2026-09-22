@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use pidmesh::converge::scan_worktree;
@@ -700,5 +701,305 @@ fn two_agents_deleting_the_same_file_do_not_conflict() -> Result<()> {
     let collisions = fleet.collisions(&alpha)?;
     let legacy = at(&collisions, "src/legacy.rs").context("expected a collision")?;
     assert_eq!(legacy["severity"], "identical", "{legacy}");
+    Ok(())
+}
+
+/// Build a repository with two linked worktrees and join an agent in each.
+///
+/// When `explicit_workspace` is set, each agent pins its own checkout as the workspace, which is
+/// the mistake that silently splits one repository into unrelated meshes.
+fn two_worktree_repository(root: &Path, explicit_workspace: bool) -> Result<(PathBuf, PathBuf)> {
+    let repository = root.join("repository");
+    let database = root.join("doctor.db");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init", "-b", "main"])?;
+    git(
+        &repository,
+        &["config", "user.email", "pidmesh@example.com"],
+    )?;
+    git(&repository, &["config", "user.name", "PidMesh Test"])?;
+    std::fs::write(repository.join("file.txt"), "mesh\n")?;
+    git(&repository, &["add", "-A"])?;
+    git(&repository, &["commit", "-m", "initial"])?;
+    for worker in 0..2 {
+        let worktree = root.join(format!("wt-{worker}"));
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("feat/{worker}"),
+                worktree.to_str().context("worktree path")?,
+            ],
+        )?;
+        let mut arguments = vec![
+            "--db".to_owned(),
+            database.to_string_lossy().into_owned(),
+            "join".to_owned(),
+            "--name".to_owned(),
+            format!("worker-{worker}"),
+            "--pid".to_owned(),
+            std::process::id().to_string(),
+        ];
+        if explicit_workspace {
+            arguments.push("--workspace".to_owned());
+            arguments.push(worktree.to_string_lossy().into_owned());
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+            .current_dir(&worktree)
+            .env_remove("PIDMESH_WORKSPACE")
+            .args(&arguments)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok((database, root.join("wt-0")))
+}
+
+fn doctor(database: &Path, from: &Path) -> Result<(Value, bool)> {
+    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .current_dir(from)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "doctor",
+        ])
+        .output()?;
+    Ok((
+        serde_json::from_slice(&output.stdout)?,
+        output.status.success(),
+    ))
+}
+
+/// The watcher is what makes convergence autonomic.
+///
+/// Agents register — any harness does that — but never call sync themselves. A single supervisor
+/// pass must still discover every overlap, because registration already recorded each checkout.
+#[test]
+fn a_watcher_observes_a_fleet_that_never_calls_sync() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let repository = directory.path().join("repository");
+    let database = directory.path().join("watch.db");
+    let binary = env!("CARGO_BIN_EXE_pidmesh");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init", "-b", "main"])?;
+    git(
+        &repository,
+        &["config", "user.email", "pidmesh@example.com"],
+    )?;
+    git(&repository, &["config", "user.name", "PidMesh Test"])?;
+    std::fs::create_dir(repository.join("src"))?;
+    std::fs::write(repository.join("src/shared.rs"), "fn shared() {}\n")?;
+    git(&repository, &["add", "-A"])?;
+    git(&repository, &["commit", "-m", "initial"])?;
+
+    for worker in 0..3 {
+        let worktree = directory.path().join(format!("wt-{worker}"));
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("feat/{worker}"),
+                worktree.to_str().context("worktree path")?,
+            ],
+        )?;
+        std::fs::write(
+            worktree.join("src/shared.rs"),
+            format!("fn shared() {{ /* {worker} */ }}\n"),
+        )?;
+        let output = Command::new(binary)
+            .current_dir(&worktree)
+            .env_remove("PIDMESH_WORKSPACE")
+            .args([
+                "--db",
+                database.to_str().context("database path")?,
+                "join",
+                "--name",
+                &format!("worker-{worker}"),
+                // A live PID, since the watcher skips checkouts whose process is gone.
+                "--pid",
+                &std::process::id().to_string(),
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = Command::new(binary)
+        .current_dir(&repository)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "watch",
+            "--once",
+            "--base",
+            "main",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pass: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(pass["checkouts"], 3, "each worktree is scanned once");
+    assert_eq!(pass["published"], 3);
+    assert_eq!(pass["skipped"].as_array().map(Vec::len), Some(0));
+    assert_eq!(pass["collision_count"], 1, "{pass}");
+    assert_eq!(pass["collisions"][0]["path"], "src/shared.rs");
+    assert_eq!(
+        pass["collisions"][0]["participants"]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_missing_checkout_is_skipped_rather_than_failing_the_sweep() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+
+    // Scanning a checkout that has been removed is an error, not a panic.
+    let removed = alpha_tree.join("does-not-exist");
+    assert!(scan_worktree(&removed, Some("main")).is_err());
+    Ok(())
+}
+
+#[test]
+fn withdrawing_a_footprint_clears_contention_without_a_scan() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    assert_eq!(fleet.collisions(&alpha)?.len(), 1);
+
+    // An agent shutting down cannot always produce a scan, so withdrawal is explicit.
+    let released = fleet.store.release_footprint(&alpha)?;
+    assert_eq!(released["released"], 1);
+    assert!(fleet.collisions(&bravo)?.is_empty());
+
+    let cleared = fleet.store.events(&bravo, 0, 500)?;
+    let cleared = cleared
+        .as_array()
+        .context("missing events")?
+        .iter()
+        .filter(|event| event["event_type"] == "collision.cleared")
+        .count();
+    assert_eq!(cleared, 1);
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_a_healthy_mesh_when_discovery_groups_the_worktrees() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (database, worktree) = two_worktree_repository(directory.path(), false)?;
+    let (report, succeeded) = doctor(&database, &worktree)?;
+    assert!(succeeded, "a healthy mesh exits zero: {report}");
+    assert_eq!(report["healthy"], true, "{report}");
+    assert_eq!(report["linked_worktree"], true);
+    assert_eq!(report["warnings"].as_array().map(Vec::len), Some(0));
+    Ok(())
+}
+
+/// The worst failure mode this system has: every command succeeds while nothing coordinates.
+#[test]
+fn doctor_catches_a_mesh_silently_split_by_an_explicit_workspace() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (database, worktree) = two_worktree_repository(directory.path(), true)?;
+    let (report, succeeded) = doctor(&database, &worktree)?;
+    assert!(!succeeded, "a split mesh must exit non-zero: {report}");
+    assert_eq!(report["healthy"], false);
+    let warnings = report["warnings"].as_array().context("warnings")?;
+    assert_eq!(warnings.len(), 1, "{report}");
+    assert_eq!(warnings[0]["code"], "split_mesh");
+    assert_eq!(
+        warnings[0]["roots"].as_array().map(Vec::len),
+        Some(2),
+        "both orphaned roots are named so the operator can see the damage"
+    );
+    Ok(())
+}
+
+/// Regression: a dead agent's footprint could never be collected.
+///
+/// The reaper only removed footprints while transitioning an agent from running to dead, and it
+/// selects only running sessions, so a worktree removed after the agent died was never
+/// revisited. The phantom collision was permanent and the dead agent could not run `unsync`.
+#[test]
+fn a_worktree_removed_after_its_agent_died_stops_contesting() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    assert_eq!(fleet.collisions(&bravo)?.len(), 1);
+
+    // Alpha exits cleanly; its preserved worktree still holds the uncommitted work.
+    fleet.store.stop_agent(&alpha)?;
+    fleet.store.collect_stale(Duration::from_secs(0))?;
+    assert_eq!(
+        fleet.collisions(&bravo)?.len(),
+        1,
+        "work still on disk still contests the path"
+    );
+
+    // Once the checkout is gone the contention cannot be real.
+    git(
+        &fleet.repository,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            alpha_tree.to_str().context("worktree path")?,
+        ],
+    )?;
+    let swept = fleet.store.collect_stale(Duration::from_secs(0))?;
+    assert_eq!(swept["abandoned_footprints"], 1, "{swept}");
+    assert!(fleet.collisions(&bravo)?.is_empty());
+
+    // Anything parked on `wait` has to learn the collision ended.
+    let events = fleet.store.events(&bravo, 0, 500)?;
+    let cleared = events
+        .as_array()
+        .context("missing events")?
+        .iter()
+        .filter(|event| event["event_type"] == "collision.cleared")
+        .count();
+    assert_eq!(cleared, 1, "the reaper announces what it cleared");
     Ok(())
 }
