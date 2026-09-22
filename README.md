@@ -171,7 +171,7 @@ pidmesh integrate --release
 | Blocker | Meaning |
 | --- | --- |
 | `stale_base` | The integration branch advanced since this worktree was cut. The diff may still apply cleanly and be wrong, because it was written against code that no longer exists. Rebase. |
-| `contested_path` | Another **live** checkout rewrote an overlapping region of a path this one changed. |
+| `contested_path` | Another **live** checkout rewrote an overlapping region of a path this one changed. Judged per pair, so the blocker names exactly which peers conflict. |
 | `integration_held` | Another agent holds the integration lease and is merging right now. |
 
 Duplicated work never blocks: if two checkouts hold byte-identical content, merging either is safe.

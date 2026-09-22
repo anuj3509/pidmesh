@@ -139,8 +139,14 @@ cut from.
 
 Three conditions block a merge. A stale base means the integration branch advanced after this
 worktree was cut, so the diff may apply cleanly and still be wrong. A contested path means another
-live checkout holds different content on a path this one changed. A held integration lease means
-another agent is merging at this moment.
+live checkout rewrote an overlapping region of a path this one changed. A held integration lease
+means another agent is merging at this moment.
+
+Contention is judged per pair rather than per path. Four checkouts can share one file while only
+two of them overlap, and the severity of the path as a whole says nothing about whether any
+particular agent may land. Each blocker therefore names the specific peers that conflict with the
+asking agent, and an agent that overlaps nobody merges even while the path it touched is
+contested by others.
 
 Two things deliberately do not block. Byte-identical content is duplicated effort, so merging
 either copy is safe, and so is an `adjacent` collision, which is precisely the case three-way

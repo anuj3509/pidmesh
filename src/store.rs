@@ -865,19 +865,31 @@ impl MeshStore {
                 {
                     continue;
                 }
-                let severity = classify(&participants);
-                // Duplicated work is safe to merge, and edits to separable regions of one file
-                // are what git three-way merges exist to resolve.
-                if severity == "identical" || severity == "adjacent" {
+                let Some(mine) = participants
+                    .iter()
+                    .find(|participant| participant.agent_id == agent_id)
+                else {
                     continue;
-                }
+                };
+                // Severity is judged per pair, not per path. Four agents can share one file while
+                // only two of them overlap; blocking the other two because the path as a whole is
+                // contested would serialize a fleet that has no actual conflict.
                 let peers: Vec<Value> = participants
                     .iter()
-                    .filter(|participant| {
-                        participant.agent_id != agent_id && participant.status == "running"
-                    })
-                    .map(|participant| {
-                        json!({"agent_id": participant.agent_id, "agent_name": participant.agent_name})
+                    .filter(|peer| peer.agent_id != agent_id && peer.status == "running")
+                    .filter_map(|peer| {
+                        let pair = [mine.clone(), peer.clone()];
+                        let severity = classify(&pair);
+                        // Duplicated work is safe to merge, and edits to separable regions of one
+                        // file are what git three-way merges exist to resolve.
+                        if severity == "identical" || severity == "adjacent" {
+                            return None;
+                        }
+                        Some(json!({
+                            "agent_id": peer.agent_id,
+                            "agent_name": peer.agent_name,
+                            "severity": severity
+                        }))
                     })
                     .collect();
                 if peers.is_empty() {
@@ -885,9 +897,8 @@ impl MeshStore {
                 }
                 blockers.push(json!({
                     "code": "contested_path",
-                    "detail": "another live checkout holds different content on this path",
+                    "detail": "another live checkout rewrote an overlapping region of this path",
                     "path": path,
-                    "severity": severity,
                     "peers": peers
                 }));
             }
